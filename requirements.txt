@@ -1,0 +1,9 @@
+pyTelegramBotAPI
+requests
+openpyxl
+openai
+pandas
+python-dotenv
+flask
+gunicorn
+# Adicione outras bibliotecas se necess
