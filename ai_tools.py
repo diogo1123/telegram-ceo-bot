@@ -18,6 +18,7 @@ EXPENSES_DETAILED_URL = "https://aws.netcontroll.com.br/netweb/api/v1/financeiro
 SALES_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/venda/produto/periodo"
 INBOUND_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/entrada-mercadoria/periodo"  # Portal: #/estoque/entrada-mercadoria
 INVENTORY_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/estoque"              # Portal: #/estoque/inventario
+STOCK_LISTING_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/listagem-estoque"  # Portal: #/relatorio/listagem-estoque
 CMV_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/listagem-cmv-produto"
 PRODUCT_URL = "https://aws.netcontroll.com.br/netweb/api/v1/estoque/produto"
 COMPOSITION_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/composicao"
@@ -692,20 +693,32 @@ def get_stock(restaurant_name, query):
     rest = find_restaurant_files(restaurant_name)
     data = []
 
-    # 1. Tenta buscar ao vivo da API de inventário
+    # 1. Tenta listagem-estoque (mais completa: tem unidade/peso)
     try:
         session = get_session_for_rest(rest['id'])
         if session:
-            r = session.get(INVENTORY_URL)
+            r = session.get(STOCK_LISTING_URL)
             if r.status_code == 200:
                 raw = r.json()
                 if isinstance(raw, list) and len(raw) > 0:
                     data = raw
-                    print(f"[get_stock] Inventário ao vivo OK — {len(data)} itens")
-                    if data:
-                        print(f"[get_stock] Campos disponíveis: {list(data[0].keys())}")
+                    print(f"[get_stock] listagem-estoque OK — {len(data)} itens | campos: {list(data[0].keys())}")
     except Exception as e:
-        print(f"[get_stock] API ao vivo falhou: {e}")
+        print(f"[get_stock] listagem-estoque falhou: {e}")
+
+    # 2. Fallback: inventário antigo
+    if not data:
+        try:
+            session = session or get_session_for_rest(rest['id'])
+            if session:
+                r = session.get(INVENTORY_URL)
+                if r.status_code == 200:
+                    raw = r.json()
+                    if isinstance(raw, list) and len(raw) > 0:
+                        data = raw
+                        print(f"[get_stock] INVENTORY_URL fallback OK — {len(data)} itens | campos: {list(data[0].keys())}")
+        except Exception as e:
+            print(f"[get_stock] INVENTORY_URL falhou: {e}")
 
     # 2. Fallback: JSON local (sincronizado pelo /sync)
     if not data:
