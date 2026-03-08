@@ -702,6 +702,8 @@ def get_stock(restaurant_name, query):
                 if isinstance(raw, list) and len(raw) > 0:
                     data = raw
                     print(f"[get_stock] Inventário ao vivo OK — {len(data)} itens")
+                    if data:
+                        print(f"[get_stock] Campos disponíveis: {list(data[0].keys())}")
     except Exception as e:
         print(f"[get_stock] API ao vivo falhou: {e}")
 
