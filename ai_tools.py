@@ -8,9 +8,8 @@ import unicodedata
 from datetime import datetime, timedelta
 
 # Import credentials from bot if possible, otherwise hardcode
-# Import credentials from environment variables (Cloud) or hardcoded (Local Backup)
-NET_USER = os.getenv("NET_USER", "diogoooalbuquerque@gmail.com")
-NET_PASS = os.getenv("NET_PASS", "Diogo1984#")
+NET_USER = os.getenv("NET_USER", "")
+NET_PASS = os.getenv("NET_PASS", "")
 LOGIN_URL = "https://aws.netcontroll.com.br/netadm/api/v1/account/login/"
 PARTNER_LOGIN_URL = "https://aws.netcontroll.com.br/netadm/api/v1/parceiro/login"
 EXPENSES_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/financeiro/conta-pagar/plano/periodo"

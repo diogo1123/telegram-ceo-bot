@@ -8,15 +8,15 @@ import ai_manager
 import ai_tools
 
 # Bot Token
-TOKEN = os.getenv("TELEGRAM_TOKEN", "8482767906:AAG5MlJz95FEwtaCCugJXuC-Tbg07ICSUak")
+TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 bot = telebot.TeleBot(TOKEN)
 
 # --- CONFIGURAÇÕES ---
 DESKTOP = os.getenv("LOCAL_DATA_PATH", "")
 
 # Credenciais do Portal
-NET_USER = os.getenv("NET_USER", "diogoooalbuquerque@gmail.com")
-NET_PASS = os.getenv("NET_PASS", "Diogo1984#")
+NET_USER = os.getenv("NET_USER", "")
+NET_PASS = os.getenv("NET_PASS", "")
 
 # API Configuration
 API_REPORT_BASE = "https://aws.netcontroll.com.br/netreport/api/v1"
