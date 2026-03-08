@@ -1577,38 +1577,29 @@ def _fetch_google_reviews(rest: dict) -> dict:
     if not place_id:
         return {"error": f"GOOGLE_PLACE_ID não configurado para {rest['name']}"}
 
-    # Places API (New) — v1
+    # Places API (legacy) — requer "Places API" habilitada no Google Cloud Console
     try:
         r = requests.get(
-            f"https://places.googleapis.com/v1/places/{place_id}",
-            headers={
-                "X-Goog-Api-Key": api_key,
-                "X-Goog-FieldMask": "displayName,rating,userRatingCount,reviews",
-                "Accept-Language": "pt-BR",
+            "https://maps.googleapis.com/maps/api/place/details/json",
+            params={
+                "place_id": place_id,
+                "fields":   "name,rating,user_ratings_total,reviews",
+                "language": "pt-BR",
+                "key":      api_key,
             },
             timeout=10,
         )
-        if r.status_code != 200:
-            return {"error": f"Places API retornou {r.status_code}: {r.text[:120]}"}
+        data = r.json()
+        status = data.get("status", "UNKNOWN")
+        if status != "OK":
+            return {"error": f"Places API: {status} — {data.get('error_message', '')}"}
 
-        result = r.json()
-
-        # Normaliza reviews para o mesmo formato do código existente
-        raw_reviews = result.get("reviews", [])
-        reviews = []
-        for rv in raw_reviews:
-            text_obj = rv.get("text", {})
-            reviews.append({
-                "author_name": rv.get("authorAttribution", {}).get("displayName", "Cliente"),
-                "rating":      rv.get("rating", 3),
-                "text":        text_obj.get("text", "") if isinstance(text_obj, dict) else str(text_obj),
-            })
-
+        result = data.get("result", {})
         return {
             "place_id":      place_id,
             "rating":        result.get("rating", 0),
-            "total_ratings": result.get("userRatingCount", 0),
-            "reviews":       reviews,
+            "total_ratings": result.get("user_ratings_total", 0),
+            "reviews":       result.get("reviews", []),
         }
     except Exception as e:
         return {"error": f"Erro ao buscar reviews: {e}"}
