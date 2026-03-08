@@ -1020,16 +1020,32 @@ if __name__ == "__main__":
     scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
     scheduler_thread.start()
     
-    # Aguarda instância anterior morrer antes de começar polling (evita erro 409 no redeploy)
-    time.sleep(10)
+    # Força reset da sessão Telegram antes de iniciar polling.
+    # Cancela qualquer long-poll anterior para evitar erro 409 no redeploy.
+    print("[startup] Resetando sessão Telegram...")
+    for attempt in range(10):
+        try:
+            bot.get_updates(offset=-1, timeout=0)
+            print("[startup] Sessão OK. Iniciando polling.")
+            break
+        except Exception as e:
+            if "409" in str(e) or "Conflict" in str(e):
+                print(f"[startup] 409 ainda ativo, aguardando 15s... ({attempt+1}/10)")
+                time.sleep(15)
+            else:
+                break
 
     while True:
         try:
-            bot.infinity_polling(timeout=90)
+            bot.infinity_polling(timeout=90, allowed_updates=["message", "callback_query", "voice"])
         except Exception as e:
             err = str(e)
             if "409" in err or "Conflict" in err:
-                print(f"[polling] Conflito 409 — outra instância ainda ativa. Aguardando 30s...")
+                print(f"[polling] Conflito 409 — aguardando 30s...")
                 time.sleep(30)
+                try:
+                    bot.get_updates(offset=-1, timeout=0)
+                except Exception:
+                    pass
             else:
                 time.sleep(5)
