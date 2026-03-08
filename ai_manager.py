@@ -4,12 +4,14 @@ import os
 import ai_tools
 from datetime import datetime
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OLLAMA_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # --- CONVERSATION MEMORY ---
-MEMORY_FILE = "conversation_memory.json"
+_DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+os.makedirs(_DATA_DIR, exist_ok=True)
+MEMORY_FILE = os.path.join(_DATA_DIR, "conversation_memory.json")
 MAX_HISTORY = 10  # Keep last 10 exchanges per chat
 
 def load_memory():
@@ -97,7 +99,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_expenses",
-            "description": "Consulta as despesas/contas a pagar filtradas num período.",
+            "description": "Consulta as despesas/contas a pagar filtradas num período (ou seja, os pagamentos FEITOS pelo restaurante para fornecedores, impostos, folha, compras, etc).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -503,7 +505,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_payment_report",
-            "description": "Analisa o faturamento por formas de pagamento (Pix, Crédito, Débito, Dinheiro) em um período.",
+            "description": "Analisa o faturamento RECEBIDO DOS CLIENTES por formas de pagamento (Pix, Crédito, Débito, Dinheiro) em um período. NUNCA use para pagamentos feitos pelo restaurante.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -639,8 +641,23 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "save_inventory_snapshot",
+            "description": "Salva o snapshot do estoque atual com data específica. Use no último dia do mês ou quando o CEO pedir 'salvar estoque', 'fechar estoque do mês', 'snapshot de estoque'. Necessário para calcular o CMV por movimentação (EI + Compras - EF) no DRE.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant_name": {"type": "string"},
+                    "date_str": {"type": "string", "description": "YYYY-MM-DD. Padrão: hoje."}
+                },
+                "required": ["restaurant_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_dre_report",
-            "description": "Gera o DRE gerencial do restaurante em formato cascata (Receita, Impostos, CMV, Folha, Despesas Fixas, Variáveis e EBITDA).",
+            "description": "Gera o DRE gerencial do restaurante. Retorna Receita, Impostos, CMV Real, CMV Teórico, Folha, Despesas e EBITDA. Quando snapshots de estoque existirem, calcula o CMV por movimentação (EI + Compras - EF) — mais preciso.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -740,6 +757,9 @@ Agora produza o relatório CEO seguindo as instruções específicas abaixo:"""
 
     if "get_dre_report" in tool_set:
         instructions.append("""
+📊 SOBRE O DRE GERENCIAL:
+- OBRIGATÓRIO: Quando citar a linha de Custos (CMV), você DEVE mencionar OBRIGATORIAMENTE tanto o "CMV Real" quanto o "CMV Teórico Esperado", evidenciando qualquer desvio ou ineficiência entre o que foi consumido na realidade e o que a ficha técnica mandava gastar.
+
 📊 DRE — CASCATA COMPLETA LINHA POR LINHA (obrigatório, não pule nenhuma linha):
 1. Receita Bruta Total → discriminada por categoria se disponível
 2. (-) Impostos → regime tributário, alíquota % e valor R$
@@ -961,6 +981,10 @@ IMPORTANTE: Cite os valores EXATOS que vieram nos dados. Não estime nem calcule
 ENCERRE SEMPRE COM:
 💡 **PLANO DE AÇÃO CEO — TOP 5 AÇÕES:**
 
+⚠️ **REGRA DE OURO PARA O PLANO DE AÇÃO**: 
+1) Se ABSOLUTAMENTE NENHUM dado (0 dados) foi retornado pelas ferramentas para o período analisado (ou seja, tudo veio como 'indisponível' ou 'vazio'), responda APENAS: "⚠️ Plano de Ação suspenso: Sem dados sistêmicos (vendas/despesas) neste recorte para formular ações concretas." e encerre.
+2) Se HOUVER PELO MENOS UM dado real válido (ex: só tem despesa mas não tem faturamento, ou vice-versa), você DEVE formular ações focadas EXCLUSIVAMENTE nos dados que retornaram, sem inventar sobre o que faltou.
+
 Regra: cada ação DEVE citar o dado real dos dados recebidos que a justifica.
 ✓ "Produto X custou R$ 9,20 na última compra (dado da ferramenta). Preço atual R$ 12,00 = markup 1,3x, abaixo do mínimo 2,5x. Ajustar para R$ 23,00 — gerente — hoje."
 ✗ "Revisar preços" — proibido. Ação sem dado que a suporte = não enviar.
@@ -1018,10 +1042,10 @@ Antes de escrever cada número na resposta, pergunte mentalmente: "Este valor es
 ════════════════════════════════════════
 - Faturamento / receita → get_revenue
 - Itens mais vendidos → get_top_selling_items
-- Buscar produto específico nas vendas → search_sales
-- Despesas por plano de contas (FOLHA, CMV, FIXO...) → get_expenses  [portal: /financeiro-conta-pagar-plano]
-- Despesas por fornecedor / ranking de quem recebeu mais → get_expenses query="por fornecedor" OU get_supplier_report  [portal: /financeiro-conta-pagar-fornecedor]
-- Formas de recebimento / Pix / Cartão / Dinheiro → get_payment_report  [portal: /faturamento-forma-pagamento]
+    - Buscar produto específico nas vendas → search_sales
+    - Pagamentos FEITOS pelo restaurante (despesas, fornecedores, contas a pagar) → get_expenses  [portal: /financeiro-conta-pagar-plano]
+    - Pagamentos RECEBIDOS de clientes (faturamento / Pix / Cartão / Dinheiro) → get_payment_report  [portal: /faturamento-forma-pagamento]
+    - Despesas por fornecedor / ranking de quem recebeu mais → get_expenses query="por fornecedor" OU get_supplier_report  [portal: /financeiro-conta-pagar-fornecedor]
 - Estoque / inventário → get_stock  [portal: #/estoque/inventario]
 - Ficha técnica de prato → get_recipe
 - Lucratividade de fichas → analyze_recipes_profitability
@@ -1242,6 +1266,8 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
                     function_response = str(ai_tools.get_dynamic_pricing_suggestions(**function_args))
                 elif function_name == "get_predictive_hr_scale":
                     function_response = str(ai_tools.get_predictive_hr_scale(**function_args))
+                elif function_name == "save_inventory_snapshot":
+                    function_response = str(ai_tools.save_inventory_snapshot(**function_args))
                 elif function_name == "get_dre_report":
                     function_response = str(ai_tools.get_dre_report(**function_args))
                 elif function_name == "get_balancete":

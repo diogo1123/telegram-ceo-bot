@@ -731,7 +731,9 @@ if __name__ == "__main__":
 
     def scheduler_loop():
         """Background scheduler: Briefing at 7AM, Proactive Alerts every 4h, Weekly Ranking on Sundays."""
-        STATE_FILE = "scheduler_state.json"
+        _data_dir = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+        os.makedirs(_data_dir, exist_ok=True)
+        STATE_FILE = os.path.join(_data_dir, "scheduler_state.json")
         
         def load_state():
             if os.path.exists(STATE_FILE):
@@ -958,6 +960,31 @@ if __name__ == "__main__":
                     except Exception as e:
                         print(f"[{now}] Erro na auditoria semanal: {e}")
                 
+                # ── Snapshot de Estoque — Segunda 07h e último dia do mês ──────
+                import calendar as _cal
+                _last_day = _cal.monthrange(now.year, now.month)[1]
+                _is_monday = now.weekday() == 0
+                _is_month_end = now.day == _last_day
+                _snap_key = f"snapshot_{today}"
+
+                if (_is_monday or _is_month_end) and now.hour >= 7 and state.get('inventory_snapshot') != _snap_key:
+                    try:
+                        from ai_tools import RESTAURANTS
+                        snap_lines = []
+                        for rest in RESTAURANTS:
+                            result = ai_tools.save_inventory_snapshot(rest['name'], today)
+                            snap_lines.append(result)
+                            print(f"[{now}] {result.splitlines()[0]}")
+
+                        label = "FIM DE MÊS" if _is_month_end else "SEMANAL"
+                        msg = (f"📦 *SNAPSHOT DE ESTOQUE — {label}*\n"
+                               f"_{today}_\n\n" + "\n\n".join(snap_lines))
+                        send_to_ceo(msg)
+                        state['inventory_snapshot'] = _snap_key
+                        save_state(state)
+                    except Exception as e:
+                        print(f"[{now}] Erro no snapshot de estoque: {e}")
+
                 # ── Alertas Proativos 5x/dia (8, 12, 16, 20, 00h) ─────────────
                 if now.hour in [8, 12, 16, 20, 0]:
                     alert_key = f"{today}_{now.hour}"

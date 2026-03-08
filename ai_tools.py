@@ -120,6 +120,8 @@ NCM_GRUPO_MAP = {
 }
 
 DESKTOP = os.getenv("LOCAL_DATA_PATH", "")
+_DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+SNAPSHOTS_DIR = os.path.join(_DATA_DIR, "estoque_snapshots")
 
 RESTAURANTS = [
     {"name": "Nauan Beach Club", "id": 18784, 
@@ -426,6 +428,144 @@ def get_compras_periodo(rest: dict, start_date: str, end_date: str) -> tuple:
             pass
 
     return 0.0, "sem dados de compras"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub Gist — armazenamento persistente para snapshots de estoque na nuvem
+# Variáveis de ambiente necessárias:
+#   GITHUB_TOKEN  → Personal Access Token com escopo "gist"
+#   GIST_ID       → ID do Gist criado (ex: "a1b2c3d4e5f6...")
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gist_enabled() -> bool:
+    return bool(os.getenv("GITHUB_TOKEN")) and bool(os.getenv("GIST_ID"))
+
+def _gist_save(filename: str, data: list) -> bool:
+    """Salva (ou atualiza) um arquivo JSON no GitHub Gist."""
+    token   = os.getenv("GITHUB_TOKEN")
+    gist_id = os.getenv("GIST_ID")
+    try:
+        r = requests.patch(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}",
+                     "Accept": "application/vnd.github.v3+json"},
+            json={"files": {filename: {"content": json.dumps(data, ensure_ascii=False)}}},
+            timeout=15,
+        )
+        return r.status_code == 200
+    except Exception as e:
+        print(f"[Gist] Erro ao salvar {filename}: {e}")
+        return False
+
+def _gist_load(filename: str):
+    """Carrega um arquivo JSON do GitHub Gist. Retorna lista ou None."""
+    token   = os.getenv("GITHUB_TOKEN")
+    gist_id = os.getenv("GIST_ID")
+    try:
+        r = requests.get(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}",
+                     "Accept": "application/vnd.github.v3+json"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        files = r.json().get("files", {})
+        if filename not in files:
+            return None
+        raw_url = files[filename].get("raw_url")
+        if not raw_url:
+            return None
+        r2 = requests.get(raw_url, timeout=15)
+        return r2.json() if r2.status_code == 200 else None
+    except Exception as e:
+        print(f"[Gist] Erro ao carregar {filename}: {e}")
+        return None
+
+
+def save_inventory_snapshot(restaurant_name: str, date_str: str = None) -> str:
+    """Salva snapshot do estoque atual em arquivo datado para uso no CMV por movimentação.
+    Chame no último dia de cada mês (ou no primeiro do mês seguinte) para cada restaurante.
+    Os snapshots são armazenados em: estoque_snapshots/<RestName>_<YYYY-MM-DD>.json
+    """
+    if not date_str:
+        date_str = datetime.now().strftime('%Y-%m-%d')
+    rest = find_restaurant_files(restaurant_name)
+    session = get_session_for_rest(rest['id'])
+    if not session:
+        return f"Erro de autenticação para {rest['name']}."
+    try:
+        r = session.get(INVENTORY_URL)
+        if r.status_code != 200:
+            return f"API retornou status {r.status_code} para {rest['name']}."
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return f"Inventário vazio ou inválido para {rest['name']}."
+    except Exception as e:
+        return f"Erro ao buscar inventário: {e}"
+    safe_name = rest['name'].replace(" ", "_").replace("/", "_")
+    filename  = f"{safe_name}_{date_str}.json"
+    valor_total = sum(
+        safe_float(s.get('estoqueAtual', 0)) * safe_float(s.get('custoAtual', 0))
+        for s in data
+    )
+    destinos = []
+
+    # 1. Salva localmente (quando DATA_DIR persistente estiver configurado ou ao rodar local)
+    try:
+        os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+        path = os.path.join(SNAPSHOTS_DIR, filename)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        destinos.append("💾 local")
+    except Exception as e:
+        print(f"[snapshot] Erro ao salvar local: {e}")
+
+    # 2. Salva no GitHub Gist (quando GITHUB_TOKEN + GIST_ID configurados)
+    if _gist_enabled():
+        ok = _gist_save(filename, data)
+        destinos.append("☁️ Gist" if ok else "⚠️ Gist falhou")
+
+    if not destinos:
+        return f"⚠️ Nenhum destino disponível para salvar snapshot de {rest['name']}."
+
+    return (f"✅ Snapshot salvo: {rest['name']} em {date_str}\n"
+            f"   {len(data)} produtos | Valor em estoque: R$ {valor_total:,.2f}\n"
+            f"   Destinos: {' + '.join(destinos)}")
+
+
+def _calc_snapshot_valor(data: list) -> float:
+    return sum(
+        safe_float(s.get('estoqueAtual', 0)) * safe_float(s.get('custoAtual', 0))
+        for s in data
+    )
+
+def _load_snapshot_value(rest_name: str, date_str: str) -> tuple:
+    """Retorna (valor_R$, fonte_str) para o snapshot mais próximo da data (±3 dias).
+    Prioridade: 1) arquivo local  2) GitHub Gist
+    """
+    safe_name = rest_name.replace(" ", "_").replace("/", "_")
+    target = datetime.strptime(date_str, '%Y-%m-%d')
+
+    for delta in range(4):
+        for sign in ([0] if delta == 0 else [1, -1]):
+            d = target + timedelta(days=delta * sign)
+            label = d.strftime('%d/%m/%Y')
+            filename = f"{safe_name}_{d.strftime('%Y-%m-%d')}.json"
+
+            # 1. Arquivo local
+            path = os.path.join(SNAPSHOTS_DIR, filename)
+            if os.path.exists(path):
+                data = load_json(path)
+                return _calc_snapshot_valor(data), f"snapshot local {label}"
+
+            # 2. GitHub Gist
+            if _gist_enabled():
+                data = _gist_load(filename)
+                if data:
+                    return _calc_snapshot_valor(data), f"snapshot Gist {label}"
+
+    return 0.0, "sem snapshot"
 
 
 def get_ficha_cost_map(rest: dict) -> tuple:
@@ -1428,27 +1568,49 @@ def get_dre_report(restaurant_name, start_date=None, end_date=None):
     sales_data = fetch_sales_data(rest['id'], start_date, end_date)
     rec_bruta = sum(safe_float(x.get('valor', 0)) for x in sales_data)
     
+    # CMV Real vs Teórico
     cmv_data = fetch_cmv_data(rest['id'], start_date, end_date)
+    erp_cost_map = {}
+    for r in cmv_data:
+        nome = str(r.get('nome', '')).strip()
+        if nome:
+            pc = safe_float(r.get('precoCompra', 0))
+            if pc > 0: erp_cost_map[normalize_text(nome)] = pc
+            
+    ficha_cost, _ = get_ficha_cost_map(rest)
+    
+    cmv_real = 0.0
+    cmv_teorico = 0.0
+    
+    for s in sales_data:
+        nome = str(s.get('nome', '')).strip()
+        if not nome or any(kw in nome.lower() for kw in {'day use', 'dayuse', 'day-use', 'aluguel toalha', 'ao ponto', 'bem passada', 'entrada', 'couvert'}): continue
+        key = normalize_text(nome)
+        qtde = safe_float(s.get('qtde', 0))
+        
+        # Real (Fallback para Ficha Técnica)
+        custo_unit = find_best_cost_match(key, erp_cost_map)
+        if custo_unit == 0: custo_unit = find_best_cost_match(key, ficha_cost)
+        cmv_real += qtde * custo_unit
+        
+        # Teórico (Somente da Ficha)
+        custo_ficha = find_best_cost_match(key, ficha_cost)
+        if custo_ficha > 0: cmv_teorico += qtde * custo_ficha
 
-    # Estoque Final
-    stock_path = rest.get('stock_file', '')
-    stock_data = load_json(stock_path) if stock_path and os.path.exists(stock_path) else []
-    cost_map = {normalize_text(str(s.get('produto', ''))): safe_float(s.get('custoAtual', 0)) for s in stock_data}
-    valor_estoque_final = sum(safe_float(s.get('valorEstoque', 0)) for s in stock_data)
-    # Compras
-    inbound = fetch_inbound_data(rest['id'], start_date, end_date)
-    total_compras = sum(safe_float(r.get('valorTotal', 0)) for r in inbound)
-    # CMV consumido por produto (qtde × custo)
-    cmv_consumido = 0.0
-    for s in fetch_sales_data(rest['id'], start_date, end_date):
-        key = normalize_text(str(s.get('nome', '')))
-        custo = cost_map.get(key, 0)
-        if custo == 0:
-            for ck, cv in cost_map.items():
-                if (key in ck or ck in key) and cv > 0: custo = cv; break
-        cmv_consumido += safe_float(s.get('qtde', 0)) * custo
-    # CMV Real = EI + Compras - EF; EI = EF + CMV_consumido - Compras
-    custo_cmv = cmv_consumido  # == EI + Compras - EF by construction
+    # CMV por movimentação de estoque (mais preciso) — usa snapshots quando disponíveis
+    ei_val, ei_fonte = _load_snapshot_value(rest['name'], start_date)
+    ef_val, ef_fonte = _load_snapshot_value(rest['name'], end_date)
+    compras_periodo, compras_fonte = get_compras_periodo(rest, start_date, end_date)
+
+    if ei_val > 0 or ef_val > 0:
+        custo_cmv = ei_val + compras_periodo - ef_val
+        cmv_fonte = f"Movimentação (EI {ei_fonte} + Compras {compras_fonte} − EF {ef_fonte})"
+    else:
+        custo_cmv = cmv_real
+        cmv_fonte = "Vendas × custo unitário ERP/FT (sem snapshots)"
+
+    cmv_real_pct = (custo_cmv / rec_bruta * 100) if rec_bruta > 0 else 0
+    cmv_teorico_pct = (cmv_teorico / rec_bruta * 100) if rec_bruta > 0 else 0
 
     
     exp_data = fetch_expenses_data(rest['id'], start_date, end_date)
@@ -1456,32 +1618,60 @@ def get_dre_report(restaurant_name, start_date=None, end_date=None):
     folha = 0
     desp_fixas = 0
     desp_variaveis = 0
-    
+    fixas_items = {}  # label -> valor acumulado
+
+    FIXAS_KEYWORDS = {
+        "ALUGUEL":        "Aluguel",
+        "AGUA":           "Água",
+        "LUZ":            "Energia",
+        "ENERGIA":        "Energia",
+        "INTERNET":       "Internet",
+        "SISTEMA":        "Sistema",
+        "SOFTPLUS":       "Sistema",
+        "VELOO":          "Sistema",
+        "CONTABILIDADE":  "Contabilidade",
+        "CONTADOR":       "Contabilidade",
+    }
+
     for exp in exp_data:
         val = safe_float(exp.get('valor', 0))
         t = f"{exp.get('planoContas1','')} {exp.get('planoContas2','')} {exp.get('historico','')} {exp.get('fornecedor','')}".upper()
-        
-        if any(x in t for x in ["SIMPLES", "ICMS", "IMPOSTO", "DAS", "TAXA"]): impostos += val
-        elif any(x in t for x in ["FOLHA", "SALARIO", "VT", "VR", "INSS", "FGTS", "RH", "RESCISAO"]): folha += val
-        elif any(x in t for x in ["ALUGUEL", "AGUA", "LUZ", "ENERGIA", "INTERNET", "SISTEMA", "CONTABILIDADE"]): desp_fixas += val
-        else: desp_variaveis += val
-        
+
+        if any(x in t for x in ["SIMPLES", "ICMS", "IMPOSTO", "DAS", "TAXA"]):
+            impostos += val
+        elif any(x in t for x in ["FOLHA", "SALARIO", "VT", "VR", "INSS", "FGTS", "RH", "RESCISAO"]):
+            folha += val
+        elif any(x in t for x in FIXAS_KEYWORDS):
+            desp_fixas += val
+            label = next((lbl for kw, lbl in FIXAS_KEYWORDS.items() if kw in t), "Outros Fixos")
+            fixas_items[label] = fixas_items.get(label, 0) + val
+        else:
+            desp_variaveis += val
+
     rec_liquida = rec_bruta - impostos
     margem_bruta = rec_liquida - custo_cmv
     ebitda = margem_bruta - folha - desp_fixas - desp_variaveis
     margem_ebitda = (ebitda / rec_bruta * 100) if rec_bruta > 0 else 0
-    
+
     report = f"🏢 **DRE GERENCIAL: {rest['name']}** ({start_date} a {end_date})\n\n"
     report += f"1️⃣ **(+) Receita Bruta:** {fmt_brl(rec_bruta)}\n"
     report += f"2️⃣ **(-) Impostos/Taxas:** {fmt_brl(impostos)}\n"
     report += f"3️⃣ **(=) Receita Líquida:** {fmt_brl(rec_liquida)}\n\n"
-    report += f"4️⃣ **(-) Custo (CMV):** {fmt_brl(custo_cmv)}\n"
+    report += f"4️⃣ **(-) CMV:** {fmt_brl(custo_cmv)} ({fmt_pct(cmv_real_pct)}% da Receita)\n"
+    report += f"    *Fonte: {cmv_fonte}*\n"
+    if ei_val > 0 or ef_val > 0:
+        report += f"    ├─ Estoque Inicial ({ei_fonte}): {fmt_brl(ei_val)}\n"
+        report += f"    ├─ (+) Compras ({compras_fonte}): {fmt_brl(compras_periodo)}\n"
+        report += f"    └─ (−) Estoque Final ({ef_fonte}): {fmt_brl(ef_val)}\n"
+    report += f"    *(_CMV Teórico Esperado: {fmt_brl(cmv_teorico)} / {fmt_pct(cmv_teorico_pct)}%_)*\n"
     report += f"5️⃣ **(=) Margem Bruta:** {fmt_brl(margem_bruta)} ({fmt_pct(((margem_bruta/rec_bruta)*100) if rec_bruta>0 else 0)}%)\n\n"
     report += f"6️⃣ **(-) Folha/RH:** {fmt_brl(folha)}\n"
     report += f"7️⃣ **(-) Despesas Fixas (Ocupação):** {fmt_brl(desp_fixas)}\n"
+    for label, val in sorted(fixas_items.items(), key=lambda x: -x[1]):
+        report += f"    ├─ {label}: {fmt_brl(val)}\n"
     report += f"8️⃣ **(-) Despesas Variáveis/Outras:** {fmt_brl(desp_variaveis)}\n\n"
     report += f"🎯 **EBITDA (Lucro Operacional):** {fmt_brl(ebitda)} ({fmt_pct(margem_ebitda)}%)\n"
-    
+
     return report
 
 def get_balancete(restaurant_name, start_date=None, end_date=None):
@@ -1934,11 +2124,23 @@ def get_purchasing_plan(restaurant_name, query=None, days_history=7, coverage_da
                             ingredient_demand[ing_name] = ingredient_demand.get(ing_name, 0) + (qty_sold * ing_qty)
         except: pass
         
-    stock_path = rest.get('stock_file')
-    if not stock_path or not os.path.exists(stock_path):
+    stock_data = []
+    try:
+        session = get_session_for_rest(rest['id'])
+        if session:
+            r = session.get(INVENTORY_URL)
+            if r.status_code == 200:
+                raw = r.json()
+                if isinstance(raw, list) and len(raw) > 0: stock_data = raw
+    except: pass
+
+    if not stock_data:
+        stock_path = rest.get('stock_file')
+        if stock_path and os.path.exists(stock_path):
+            stock_data = load_json(stock_path)
+            
+    if not stock_data:
         return f"Lista de Estoque inacessível para {rest['name']}."
-        
-    stock_data = load_json(stock_path)
     suggestions = []
     
     # Pre-aggregate stock to avoid duplicates returned by API
@@ -3843,11 +4045,23 @@ def get_inventory_turnover(restaurant_name, query=None):
         except: pass
 
     # 3. Fetch Stock
-    stock_path = rest.get('stock_file')
-    if not stock_path or not os.path.exists(stock_path):
+    stock_data = []
+    try:
+        session = get_session_for_rest(rest['id'])
+        if session:
+            r = session.get(INVENTORY_URL)
+            if r.status_code == 200:
+                raw = r.json()
+                if isinstance(raw, list) and len(raw) > 0: stock_data = raw
+    except: pass
+
+    if not stock_data:
+        stock_path = rest.get('stock_file')
+        if stock_path and os.path.exists(stock_path):
+            stock_data = load_json(stock_path)
+            
+    if not stock_data:
         return f"Dados de estoque Live indisponíveis para {rest['name']}."
-        
-    stock_data = load_json(stock_path)
     
     # Pre-aggregate stock
     stock_map = {}
