@@ -262,8 +262,8 @@ def build_question_for_action(action_key: str, restaurant_name: str) -> str:
         # RH e Operação
         "escala":         prefix + "Calcule a necessidade de RH e escala de equipe para amanhã.",
         "garcons":        prefix + "Gere o relatório de produtividade e comissões dos garçons.",
-        "caixa":          prefix + "Audite as quebras de caixa do período atual.",
-        "cancelamentos":  prefix + "Analise os motivos de cancelamentos de itens do período atual.",
+        "caixa":          prefix + "Audite as quebras de caixa dos últimos 30 dias.",
+        "cancelamentos":  prefix + "Analise os motivos de cancelamentos de itens dos últimos 30 dias.",
         "review":         prefix + "Mostre o painel consolidado de avaliações Google das 3 casas (nota, reviews negativos, tendência).",
         "review_casa":    prefix + "Analise as avaliações Google + cancelamentos + faturamento de uma casa específica.",
         "fraude":         prefix + "Verifique alertas de fraude e anti-perdas em tempo real.",

@@ -4375,7 +4375,14 @@ def get_cancellation_report(restaurant_name, start_date, end_date=None):
         
         data = resp.json()
         if not data:
-            return f"Nenhum cancelamento registrado no {rest['name']} no período de {start_date} a {end_date}."
+            return (
+                f"🔎 AUDITORIA DE CANCELAMENTOS: {rest['name'].upper()}\n"
+                f"📅 Período: {start_date} a {end_date}\n"
+                f"---\n"
+                f"✅ Total cancelado: R$ 0,00 (0 itens)\n"
+                f"✅ Nenhum cancelamento registrado no período — indicador operacional positivo.\n"
+                f"💡 Plano de Ação: operação sem perdas por cancelamento. Manter treinamento de equipe e conferência de pedidos."
+            )
             
         # Analysis
         total_value = 0
