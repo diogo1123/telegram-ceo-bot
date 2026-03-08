@@ -264,7 +264,8 @@ def build_question_for_action(action_key: str, restaurant_name: str) -> str:
         "garcons":        prefix + "Gere o relatório de produtividade e comissões dos garçons.",
         "caixa":          prefix + "Audite as quebras de caixa do período atual.",
         "cancelamentos":  prefix + "Analise os motivos de cancelamentos de itens do período atual.",
-        "review":         prefix + "Analise o customer success (Google Reviews vs faturamento).",
+        "review":         prefix + "Mostre o painel consolidado de avaliações Google das 3 casas (nota, reviews negativos, tendência).",
+        "review_casa":    prefix + "Analise as avaliações Google + cancelamentos + faturamento de uma casa específica.",
         "fraude":         prefix + "Verifique alertas de fraude e anti-perdas em tempo real.",
         # Geral
         "resumo_diario":  prefix + "Gere o briefing executivo diário completo.",

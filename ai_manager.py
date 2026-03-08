@@ -628,14 +628,23 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_customer_success_report",
-            "description": "Analisa o faturamento vs. avaliações do Google/Ifood para entender se a folha (equipe) segurou o atendimento.",
+            "description": "Análise completa de satisfação de clientes: avaliações reais do Google (nota, temas, reviews negativos), cancelamentos do sistema e tendência de faturamento. Use quando pedirem 'avaliações', 'reviews', 'satisfação', 'nota Google', 'reclamações' de uma casa específica.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "restaurant_name": {"type": "string"}
+                    "restaurant_name": {"type": "string"},
+                    "days": {"type": "integer", "description": "Período de análise em dias. Padrão: 30."}
                 },
                 "required": ["restaurant_name"]
             }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_reviews_consolidated",
+            "description": "Painel consolidado de avaliações Google das 3 casas (nota, total de avaliações, reviews negativos recentes). Use quando pedirem 'avaliações das casas', 'notas Google do grupo', 'ranking de satisfação'.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
     {
@@ -1078,7 +1087,8 @@ Antes de escrever cada número na resposta, pergunte mentalmente: "Este valor es
 - Raio-X financeiro → get_financial_snapshot
 - Auditoria de cadastro → audit_product_registration
 - Alterar preço no ERP → apply_price_change
-- Avaliações / Google → get_customer_success_report
+- Avaliações de uma casa (Google + cancelamentos + faturamento) → get_customer_success_report
+- Painel de avaliações das 3 casas → get_reviews_consolidated
 - DRE gerencial → get_dre_report
 - Balancete / saldos contábeis → get_balancete  [portal: #/relatorio/balancete]
 - Fraude em tempo real (hoje) → get_realtime_fraud_alert
@@ -1266,6 +1276,8 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
                     function_response = str(ai_tools.get_dynamic_pricing_suggestions(**function_args))
                 elif function_name == "get_predictive_hr_scale":
                     function_response = str(ai_tools.get_predictive_hr_scale(**function_args))
+                elif function_name == "get_reviews_consolidated":
+                    function_response = str(ai_tools.get_reviews_consolidated())
                 elif function_name == "save_inventory_snapshot":
                     function_response = str(ai_tools.save_inventory_snapshot(**function_args))
                 elif function_name == "get_dre_report":

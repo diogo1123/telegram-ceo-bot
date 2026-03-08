@@ -122,24 +122,31 @@ DESKTOP = os.getenv("LOCAL_DATA_PATH", "")
 _DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 SNAPSHOTS_DIR = os.path.join(_DATA_DIR, "estoque_snapshots")
 
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
+
 RESTAURANTS = [
-    {"name": "Nauan Beach Club", "id": 18784, 
-     "sales_file": os.path.join(DESKTOP, "Vendas_Nauan_LIVE.json") if DESKTOP else None, 
+    {"name": "Nauan Beach Club", "id": 18784,
+     "google_place_id": os.getenv("GOOGLE_PLACE_ID_NAUAN", ""),
+     "sales_file": os.path.join(DESKTOP, "Vendas_Nauan_LIVE.json") if DESKTOP else None,
      "stock_file": os.path.join(DESKTOP, "Estoque_Nauan_LIVE.json") if DESKTOP else None,
      "expense_file": os.path.join(DESKTOP, "Despesas_Nauan_LIVE.json") if DESKTOP else None,
      "inbound_file": os.path.join(DESKTOP, "entrada de mercadorias nauan.xlsx") if DESKTOP else None,
-     "recipe_file": os.path.join(DESKTOP, "composições nauan.xlsx") if DESKTOP else None
+     "recipe_file": os.path.join(DESKTOP, "composições nauan.xlsx") if DESKTOP else None,
     },
-    {"name": "Milagres do Toque", "id": 19165, 
-     "sales_file": os.path.join(DESKTOP, "Vendas_Milagres_LIVE.json") if DESKTOP else None, 
+    {"name": "Milagres do Toque", "id": 19165,
+     "google_place_id": os.getenv("GOOGLE_PLACE_ID_MILAGRES", ""),
+     "sales_file": os.path.join(DESKTOP, "Vendas_Milagres_LIVE.json") if DESKTOP else None,
      "stock_file": os.path.join(DESKTOP, "Estoque_Milagres_LIVE.json") if DESKTOP else None,
      "expense_file": os.path.join(DESKTOP, "Despesas_Milagres_LIVE.json") if DESKTOP else None,
-     "inbound_file": None, "recipe_file": None},
-    {"name": "Ahau Arte e Cozinha", "id": 20814, 
-     "sales_file": os.path.join(DESKTOP, "Vendas_Ahau_LIVE.json") if DESKTOP else None, 
+     "inbound_file": None, "recipe_file": None,
+    },
+    {"name": "Ahau Arte e Cozinha", "id": 20814,
+     "google_place_id": os.getenv("GOOGLE_PLACE_ID_AHAU", ""),
+     "sales_file": os.path.join(DESKTOP, "Vendas_Ahau_LIVE.json") if DESKTOP else None,
      "stock_file": os.path.join(DESKTOP, "Estoque_Ahau_LIVE.json") if DESKTOP else None,
      "expense_file": os.path.join(DESKTOP, "Despesas_Ahau_LIVE.json") if DESKTOP else None,
-     "inbound_file": None, "recipe_file": None},
+     "inbound_file": None, "recipe_file": None,
+    },
 ]
 
 def load_json(path):
@@ -1537,25 +1544,232 @@ def apply_price_change(restaurant_name, product_name, price_change):
     except Exception as e:
         return f"Erro ao aplicar preço: {str(e)}"
 
-def get_customer_success_report(restaurant_name, days=7):
-    import random
+# ─────────────────────────────────────────────────────────────────────────────
+# Google Places — busca de avaliações reais
+# Variáveis de ambiente:
+#   GOOGLE_PLACES_API_KEY     → chave da Google Places API
+#   GOOGLE_PLACE_ID_NAUAN     → Place ID do Nauan Beach Club
+#   GOOGLE_PLACE_ID_MILAGRES  → Place ID do Milagres do Toque
+#   GOOGLE_PLACE_ID_AHAU      → Place ID do Ahau Arte e Cozinha
+# Para obter o Place ID: https://developers.google.com/maps/documentation/places/web-service/place-id
+# ─────────────────────────────────────────────────────────────────────────────
+
+_POSITIVE_KW = {'ótimo','excelente','incrível','delicioso','maravilhoso','perfeito',
+                'adorei','amei','recomendo','fantástico','sensacional','impecável',
+                'nota 10','top','lindo','especial','gostoso','atencioso','rápido',
+                'capricho','superou','surpreendeu','voltarei','voltamos'}
+_NEGATIVE_KW = {'ruim','péssimo','horrível','demora','demorou','frio','errado',
+                'errou','decepcionou','decepção','insosso','caro demais','salgado',
+                'atendimento','descaso','abandonado','sujo','barata','mosca',
+                'nunca mais','não recomendo','cancelei','esperamos','esperou'}
+
+def _fetch_google_reviews(rest: dict) -> dict:
+    """Busca avaliações reais via Google Places API.
+    Retorna dict com rating, total_ratings, reviews list.
+    """
+    api_key   = GOOGLE_PLACES_API_KEY
+    place_id  = rest.get("google_place_id", "")
+
+    if not api_key:
+        return {"error": "GOOGLE_PLACES_API_KEY não configurada"}
+
+    # Se não tiver place_id configurado, busca pelo nome
+    if not place_id:
+        try:
+            r = requests.get(
+                "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+                params={"input": rest["name"] + " São Miguel dos Milagres",
+                        "inputtype": "textquery",
+                        "fields": "place_id",
+                        "key": api_key},
+                timeout=10,
+            )
+            data = r.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                place_id = candidates[0].get("place_id", "")
+        except Exception as e:
+            return {"error": f"Erro ao buscar place_id: {e}"}
+
+    if not place_id:
+        return {"error": f"Place ID não encontrado para {rest['name']}"}
+
+    try:
+        r = requests.get(
+            "https://maps.googleapis.com/maps/api/place/details/json",
+            params={"place_id": place_id,
+                    "fields": "name,rating,user_ratings_total,reviews",
+                    "language": "pt-BR",
+                    "key": api_key},
+            timeout=10,
+        )
+        result = r.json().get("result", {})
+        return {
+            "place_id":      place_id,
+            "rating":        result.get("rating", 0),
+            "total_ratings": result.get("user_ratings_total", 0),
+            "reviews":       result.get("reviews", []),
+        }
+    except Exception as e:
+        return {"error": f"Erro ao buscar reviews: {e}"}
+
+
+def _analyze_review_sentiment(text: str) -> str:
+    words = set(text.lower().split())
+    pos = len(words & _POSITIVE_KW)
+    neg = len(words & _NEGATIVE_KW)
+    if pos > neg:   return "positivo"
+    if neg > pos:   return "negativo"
+    return "neutro"
+
+
+def _extract_review_themes(reviews: list) -> dict:
+    """Extrai temas recorrentes dos reviews: atendimento, comida, espera, preço, ambiente."""
+    themes = {
+        "atendimento":  {"kw": {"atendimento","garçom","garçom","equipe","staff","simpático","educado","grosso","demora"},     "pos": 0, "neg": 0},
+        "comida":       {"kw": {"comida","prato","sabor","gostoso","delicioso","insosso","frio","mal passado","porcão"},        "pos": 0, "neg": 0},
+        "espera":       {"kw": {"espera","demorou","demora","rápido","ágil","esperamos","esperou","lento"},                    "pos": 0, "neg": 0},
+        "preço":        {"kw": {"preço","caro","barato","valor","custo","vale","não vale","justo"},                            "pos": 0, "neg": 0},
+        "ambiente":     {"kw": {"ambiente","vista","praia","lindo","bonito","agradável","barulho","quente","estrutura"},       "pos": 0, "neg": 0},
+    }
+    for rev in reviews:
+        text  = rev.get("text", "").lower()
+        stars = rev.get("rating", 3)
+        words = set(text.split())
+        for theme, data in themes.items():
+            if words & data["kw"]:
+                if stars >= 4: data["pos"] += 1
+                elif stars <= 2: data["neg"] += 1
+    return themes
+
+
+def get_customer_success_report(restaurant_name, days=30):
+    """Analisa avaliações reais do Google + cancelamentos + tendência de faturamento."""
     rest = find_restaurant_files(restaurant_name)
-    sales = fetch_sales_data(rest['id'], (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'))
-    faturamento = sum(safe_float(s.get('valor', 0)) for s in sales)
-    
-    avaliacoes_positivas = random.randint(5, 15)
-    avaliacoes_negativas = random.randint(0, 3)
-    
-    report = f"🌟 **Customer Success Tracker (NPS Relâmpago)**\n\n"
-    report += f"📊 Faturamento de Ontem ({rest['name']}): {fmt_brl(faturamento)}\n"
-    report += f"✅ Novas Avaliações (Google/TripAdvisor): {avaliacoes_positivas} positivas.\n"
-    report += f"❌ Reclamações mapeadas: {avaliacoes_negativas}.\n\n"
-    
-    if avaliacoes_negativas > 0:
-         report += "⚠️ **ALERTA CRÍTICO:** O cruzamento financeiro mostra que faturamos muito (casa cheia), mas a folha/escala de garçons de ontem estava 15% inferior ao volume exigido, gerando avaliações de 'Demora no atendimento'. Escalar extras urgentemente para o próximo pico."
+    now  = datetime.now()
+    end  = now.strftime('%Y-%m-%d')
+    start_cur  = (now - timedelta(days=days)).strftime('%Y-%m-%d')
+    start_prev = (now - timedelta(days=days*2)).strftime('%Y-%m-%d')
+    end_prev   = (now - timedelta(days=days+1)).strftime('%Y-%m-%d')
+
+    # ── 1. Faturamento: período atual vs. anterior ────────────────────────────
+    sales_cur  = fetch_sales_data(rest['id'], start_cur, end)
+    sales_prev = fetch_sales_data(rest['id'], start_prev, end_prev)
+    fat_cur  = sum(safe_float(s.get('valor', 0)) for s in sales_cur)
+    fat_prev = sum(safe_float(s.get('valor', 0)) for s in sales_prev)
+    fat_var  = ((fat_cur - fat_prev) / fat_prev * 100) if fat_prev > 0 else 0
+
+    # ── 2. Cancelamentos ──────────────────────────────────────────────────────
+    try:
+        session = get_session_for_rest(rest['id'])
+        r_canc = session.get(CANCELLATION_URL, params={
+            'DataInicial': f"{start_cur}T03:00:00.000Z",
+            'DataFinal':   f"{end}T23:59:59.000Z",
+        }, timeout=10) if session else None
+        cancels = r_canc.json() if r_canc and r_canc.status_code == 200 else []
+    except Exception:
+        cancels = []
+    total_cancels  = len(cancels)
+    valor_cancels  = sum(safe_float(c.get('valor', 0)) for c in cancels)
+    cancel_rate    = (valor_cancels / fat_cur * 100) if fat_cur > 0 else 0
+
+    # ── 3. Google Reviews ─────────────────────────────────────────────────────
+    gdata   = _fetch_google_reviews(rest)
+    g_error = gdata.get("error")
+    reviews = gdata.get("reviews", [])
+    rating  = gdata.get("rating", 0)
+    total_r = gdata.get("total_ratings", 0)
+
+    sentimentos = {"positivo": 0, "negativo": 0, "neutro": 0}
+    notas = []
+    for rev in reviews:
+        s = _analyze_review_sentiment(rev.get("text", ""))
+        sentimentos[s] += 1
+        notas.append(rev.get("rating", 3))
+
+    avg_recent = (sum(notas) / len(notas)) if notas else 0
+    themes     = _extract_review_themes(reviews)
+
+    # ── Montagem do relatório ─────────────────────────────────────────────────
+    report  = f"⭐ **AVALIAÇÕES & SATISFAÇÃO — {rest['name']}**\n"
+    report += f"_Período: últimos {days} dias_\n\n"
+
+    # Bloco Google
+    if g_error:
+        report += f"📍 **Google Reviews:** {g_error}\n"
+        report += f"   _(Configure GOOGLE_PLACES_API_KEY e GOOGLE_PLACE_ID no Railway)_\n\n"
     else:
-         report += "🏆 **EXCELENTE:** Operação impecável! A equipe segurou o volume de vendas sem queda na percepção de qualidade pelo cliente."
-         
+        stars_bar = "⭐" * round(rating)
+        report += f"📍 **Google Reviews:** {rating:.1f}/5 {stars_bar} ({total_r:,} avaliações totais)\n"
+        if reviews:
+            report += f"   Últimas {len(reviews)} avaliações: "
+            report += f"😊 {sentimentos['positivo']} positivas | "
+            report += f"😐 {sentimentos['neutro']} neutras | "
+            report += f"😞 {sentimentos['negativo']} negativas\n"
+            if avg_recent:
+                trend = "📈" if avg_recent >= rating else "📉"
+                report += f"   Média recente: {avg_recent:.1f} {trend}\n"
+
+        # Temas
+        report += "\n📌 **Temas recorrentes:**\n"
+        for theme, data in themes.items():
+            if data["pos"] + data["neg"] > 0:
+                bar = "🟢" * data["pos"] + "🔴" * data["neg"]
+                report += f"   {theme.capitalize()}: {bar}\n"
+
+        # Reviews negativos recentes (alerta)
+        neg_reviews = [r for r in reviews if r.get("rating", 5) <= 2]
+        if neg_reviews:
+            report += f"\n🚨 **{len(neg_reviews)} avaliação(ões) negativa(s) recente(s):**\n"
+            for rev in neg_reviews[:3]:
+                autor = rev.get("author_name", "Cliente")
+                texto = rev.get("text", "")[:120]
+                report += f"   • _{autor}_: \"{texto}...\"\n"
+
+    # Bloco Financeiro
+    seta = "📈" if fat_var >= 0 else "📉"
+    report += f"\n💰 **Faturamento ({days}d):** {fmt_brl(fat_cur)} {seta} {fat_var:+.1f}% vs. período anterior\n"
+
+    # Bloco Cancelamentos
+    canc_icon = "🟢" if cancel_rate < 2 else ("🟡" if cancel_rate < 5 else "🔴")
+    report += f"{canc_icon} **Cancelamentos:** {total_cancels} itens | {fmt_brl(valor_cancels)} ({cancel_rate:.1f}% do faturamento)\n"
+
+    # Diagnóstico cruzado
+    report += "\n🧠 **Diagnóstico cruzado:**\n"
+    if not g_error and rating < 4.0:
+        report += f"   ⚠️ Nota Google abaixo de 4.0 — investigar reviews negativos e responder publicamente.\n"
+    if cancel_rate > 5:
+        report += f"   ⚠️ Taxa de cancelamento alta ({cancel_rate:.1f}%) — pode indicar erros de pedido ou insatisfação.\n"
+    if fat_var < -10:
+        report += f"   ⚠️ Queda de faturamento de {fat_var:.1f}% — verificar se há correlação com avaliações negativas.\n"
+    if (not g_error and rating >= 4.5) and fat_var >= 0 and cancel_rate < 2:
+        report += f"   ✅ Operação saudável: boa nota, faturamento estável e baixo cancelamento.\n"
+
+    return report
+
+
+def get_reviews_consolidated() -> str:
+    """Relatório consolidado de avaliações das 3 casas para visão CEO."""
+    report = "⭐ **PAINEL DE AVALIAÇÕES — GRUPO MILAGRES**\n\n"
+    for rest in RESTAURANTS:
+        gdata  = _fetch_google_reviews(rest)
+        rating = gdata.get("rating", 0)
+        total  = gdata.get("total_ratings", 0)
+        error  = gdata.get("error")
+        reviews = gdata.get("reviews", [])
+        notas   = [r.get("rating", 3) for r in reviews]
+        avg_rec = (sum(notas) / len(notas)) if notas else 0
+        neg_rec = sum(1 for n in notas if n <= 2)
+
+        if error:
+            report += f"🏠 **{rest['name']}**: sem dados ({error})\n"
+        else:
+            trend  = ("📈" if avg_rec >= rating else "📉") if avg_rec else ""
+            report += f"🏠 **{rest['name']}**: {rating:.1f}⭐ ({total:,} avaliações) {trend}\n"
+            if neg_rec:
+                report += f"   🚨 {neg_rec} avaliação(ões) negativa(s) recente(s)\n"
+
+    report += "\n_Use 'avaliações [nome da casa]' para análise detalhada._"
     return report
 
 def get_dre_report(restaurant_name, start_date=None, end_date=None):
