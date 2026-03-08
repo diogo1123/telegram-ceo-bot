@@ -1022,19 +1022,20 @@ if __name__ == "__main__":
     scheduler_thread.start()
     
     # Aguarda a sessão anterior expirar antes de iniciar polling.
-    # timeout=20 no infinity_polling garante que a conexão antiga fecha em 20s.
-    # O sleep de 35s dá margem para a sessão anterior morrer com segurança.
-    print("[startup] Aguardando sessão anterior expirar...")
-    time.sleep(35)
+    # infinity_polling engole exceções internamente — usamos polling() para ter
+    # controle total sobre erros 409 (conflito de instâncias).
+    print("[startup] Aguardando sessão anterior expirar (60s)...")
+    time.sleep(60)
     print("[startup] Iniciando polling.")
 
     while True:
         try:
-            bot.infinity_polling(timeout=20, allowed_updates=["message", "callback_query", "voice"])
+            bot.polling(non_stop=False, timeout=20, allowed_updates=["message", "callback_query", "voice"])
         except Exception as e:
             err = str(e)
             if "409" in err or "Conflict" in err:
-                print(f"[polling] 409 — aguardando 35s antes de tentar novamente...")
-                time.sleep(35)
+                print(f"[polling] 409 — aguardando 60s antes de tentar novamente...")
+                time.sleep(60)
             else:
+                print(f"[polling] erro: {err[:120]} — aguardando 5s...")
                 time.sleep(5)
