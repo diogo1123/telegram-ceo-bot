@@ -1020,8 +1020,16 @@ if __name__ == "__main__":
     scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
     scheduler_thread.start()
     
+    # Aguarda instância anterior morrer antes de começar polling (evita erro 409 no redeploy)
+    time.sleep(10)
+
     while True:
         try:
             bot.infinity_polling(timeout=90)
         except Exception as e:
-            time.sleep(5)
+            err = str(e)
+            if "409" in err or "Conflict" in err:
+                print(f"[polling] Conflito 409 — outra instância ainda ativa. Aguardando 30s...")
+                time.sleep(30)
+            else:
+                time.sleep(5)
