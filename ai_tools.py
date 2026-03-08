@@ -717,41 +717,60 @@ def get_stock(restaurant_name, query):
     q_low = normalize_text(query)
     is_generic = q_low in ['estoque', 'inventario', 'tudo', 'completo', 'geral', '']
 
-    matches = []
+    # Coleta todas as entradas correspondentes
+    raw_matches = []
     for row in data:
         n = row.get('produto', '')
         if is_generic or match_query(query, n):
-            est  = safe_float(row.get('estoqueAtual', 0))
+            est   = safe_float(row.get('estoqueAtual', 0))
             custo = safe_float(row.get('custoAtual', 0))
-            matches.append({
-                'nome': n,
-                'estoque': est,
-                'custo': custo,
-                'total': est * custo
-            })
+            raw_matches.append({'nome': n, 'estoque': est, 'custo': custo})
 
-    if not matches:
+    if not raw_matches:
         return f"Produto '{query}' não encontrado no estoque de {rest['name']}."
 
-    matches.sort(key=lambda x: SequenceMatcher(None, q_low, normalize_text(x['nome'])).ratio(), reverse=True)
+    # Consolida entradas com mesmo nome (sistema duplica por lote/localização)
+    consolidated = {}
+    for m in raw_matches:
+        key = m['nome'].strip().upper()
+        if key not in consolidated:
+            consolidated[key] = {'nome': m['nome'], 'estoque': 0.0, 'valor': 0.0, 'entries': 0}
+        consolidated[key]['estoque'] += m['estoque']
+        consolidated[key]['valor']   += m['estoque'] * m['custo']
+        consolidated[key]['entries'] += 1
 
-    # Para consultas genéricas, mostra top 30 por valor; para produto específico, mostra os 5 mais relevantes
+    matches = []
+    for key, c in consolidated.items():
+        custo_medio = (c['valor'] / c['estoque']) if c['estoque'] > 0 else 0
+        matches.append({
+            'nome':    c['nome'],
+            'estoque': c['estoque'],
+            'custo':   custo_medio,
+            'total':   c['valor'],
+            'entries': c['entries'],
+        })
+
+    if not is_generic:
+        matches.sort(key=lambda x: SequenceMatcher(None, q_low, normalize_text(x['nome'])).ratio(), reverse=True)
+
+    # Para consultas genéricas, mostra top 30 por valor; para produto específico, mostra os 10 mais relevantes
     if is_generic:
         matches_show = sorted(matches, key=lambda x: -x['total'])[:30]
         total_val = sum(m['total'] for m in matches)
         res = f"📦 **INVENTÁRIO — {rest['name']}** _(portal: #/estoque/inventario)_\n"
-        res += f"Total de itens: {len(matches)} | Capital em estoque: R${fmt_brl(total_val)}\n\n"
+        res += f"Total de produtos únicos: {len(matches)} | Capital em estoque: R${fmt_brl(total_val)}\n\n"
         for m in matches_show:
             alerta = " ⚠️ RUPTURA" if m['estoque'] <= 0 else (" 🔻 BAIXO" if m['estoque'] < 3 else "")
             res += f"• *{m['nome']}*: {fmt_brl(m['estoque'], 2)} unid × R${fmt_brl(m['custo'])} = R${fmt_brl(m['total'])}{alerta}\n"
         if len(matches) > 30:
             res += f"\n_...e mais {len(matches)-30} itens. Peça 'estoque completo' para ver todos._"
     else:
-        matches_show = matches[:5]
+        matches_show = matches[:10]
         res = f"📦 **Estoque — '{query}' em {rest['name']}**\n"
         for m in matches_show:
             alerta = " ⚠️ RUPTURA" if m['estoque'] <= 0 else (" 🔻 ESTOQUE BAIXO" if m['estoque'] < 3 else "")
-            res += f"• *{m['nome']}*: {fmt_brl(m['estoque'], 2)} unid | Custo unit.: R${fmt_brl(m['custo'])} | Total em estoque: R${fmt_brl(m['total'])}{alerta}\n"
+            nota_dup = f" _(consolidado de {m['entries']} entradas)_" if m['entries'] > 1 else ""
+            res += f"• *{m['nome']}*: **{fmt_brl(m['estoque'], 2)} unid** | Custo médio: R${fmt_brl(m['custo'])} | Total: R${fmt_brl(m['total'])}{alerta}{nota_dup}\n"
 
     return res
 
