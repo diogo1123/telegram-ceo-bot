@@ -990,9 +990,10 @@ IMPORTANTE: Cite os valores EXATOS que vieram nos dados. Não estime nem calcule
 ENCERRE SEMPRE COM:
 💡 **PLANO DE AÇÃO CEO — TOP 5 AÇÕES:**
 
-⚠️ **REGRA DE OURO PARA O PLANO DE AÇÃO**: 
-1) Se ABSOLUTAMENTE NENHUM dado (0 dados) foi retornado pelas ferramentas para o período analisado (ou seja, tudo veio como 'indisponível' ou 'vazio'), responda APENAS: "⚠️ Plano de Ação suspenso: Sem dados sistêmicos (vendas/despesas) neste recorte para formular ações concretas." e encerre.
-2) Se HOUVER PELO MENOS UM dado real válido (ex: só tem despesa mas não tem faturamento, ou vice-versa), você DEVE formular ações focadas EXCLUSIVAMENTE nos dados que retornaram, sem inventar sobre o que faltou.
+⚠️ **REGRA DE OURO PARA O PLANO DE AÇÃO**:
+1) Se ABSOLUTAMENTE NENHUM dado (0 dados) foi retornado pelas ferramentas para o período analisado (ou seja, tudo veio como 'indisponível' ou 'vazio'), responda APENAS: "⚠️ Plano de Ação suspenso: Sem dados disponíveis neste recorte para formular ações concretas." e encerre.
+2) Se HOUVER PELO MENOS UM dado real válido — incluindo avaliações Google (nota, temas, reviews negativos), faturamento, cancelamentos, despesas ou vendas — você DEVE formular ações focadas EXCLUSIVAMENTE nos dados que retornaram, sem inventar sobre o que faltou.
+   Exemplos de dado válido: nota Google 4.2⭐, tema "atendimento" com 3 críticas negativas, cancelamento de R$800, faturamento de R$42k.
 
 Regra: cada ação DEVE citar o dado real dos dados recebidos que a justifica.
 ✓ "Produto X custou R$ 9,20 na última compra (dado da ferramenta). Preço atual R$ 12,00 = markup 1,3x, abaixo do mínimo 2,5x. Ajustar para R$ 23,00 — gerente — hoje."

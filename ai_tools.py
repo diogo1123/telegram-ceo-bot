@@ -1575,40 +1575,40 @@ def _fetch_google_reviews(rest: dict) -> dict:
 
     # Se não tiver place_id configurado, busca pelo nome
     if not place_id:
-        try:
-            r = requests.get(
-                "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
-                params={"input": rest["name"] + " São Miguel dos Milagres",
-                        "inputtype": "textquery",
-                        "fields": "place_id",
-                        "key": api_key},
-                timeout=10,
-            )
-            data = r.json()
-            candidates = data.get("candidates", [])
-            if candidates:
-                place_id = candidates[0].get("place_id", "")
-        except Exception as e:
-            return {"error": f"Erro ao buscar place_id: {e}"}
+        return {"error": f"GOOGLE_PLACE_ID não configurado para {rest['name']}"}
 
-    if not place_id:
-        return {"error": f"Place ID não encontrado para {rest['name']}"}
-
+    # Places API (New) — v1
     try:
         r = requests.get(
-            "https://maps.googleapis.com/maps/api/place/details/json",
-            params={"place_id": place_id,
-                    "fields": "name,rating,user_ratings_total,reviews",
-                    "language": "pt-BR",
-                    "key": api_key},
+            f"https://places.googleapis.com/v1/places/{place_id}",
+            headers={
+                "X-Goog-Api-Key": api_key,
+                "X-Goog-FieldMask": "displayName,rating,userRatingCount,reviews",
+                "Accept-Language": "pt-BR",
+            },
             timeout=10,
         )
-        result = r.json().get("result", {})
+        if r.status_code != 200:
+            return {"error": f"Places API retornou {r.status_code}: {r.text[:120]}"}
+
+        result = r.json()
+
+        # Normaliza reviews para o mesmo formato do código existente
+        raw_reviews = result.get("reviews", [])
+        reviews = []
+        for rv in raw_reviews:
+            text_obj = rv.get("text", {})
+            reviews.append({
+                "author_name": rv.get("authorAttribution", {}).get("displayName", "Cliente"),
+                "rating":      rv.get("rating", 3),
+                "text":        text_obj.get("text", "") if isinstance(text_obj, dict) else str(text_obj),
+            })
+
         return {
             "place_id":      place_id,
             "rating":        result.get("rating", 0),
-            "total_ratings": result.get("user_ratings_total", 0),
-            "reviews":       result.get("reviews", []),
+            "total_ratings": result.get("userRatingCount", 0),
+            "reviews":       reviews,
         }
     except Exception as e:
         return {"error": f"Erro ao buscar reviews: {e}"}
