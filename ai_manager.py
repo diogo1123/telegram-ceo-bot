@@ -65,14 +65,15 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_top_selling_items",
-            "description": "Obtém a lista dos itens mais vendidos no restaurante (Top N) num período.",
+            "description": "Ranking dos itens mais vendidos por faturamento. Suporta filtro por categoria: use category='bebidas' para drinks/bar, category='cervejas', category='destilados', category='vinhos', category='sucos', category='alimentos' para comida, category='pratos' para pratos, category='dayuse' para taxas de day use. Quando o usuário pedir 'drinks mais vendidos', 'cervejas mais vendidas', 'pratos mais pedidos', etc., SEMPRE passe o parâmetro category correspondente.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "restaurant_name": {"type": "string", "description": "Nome do restaurante."},
-                    "top_n": {"type": "integer", "description": "Número de itens para retornar (padrão 5)."},
-                    "start_date": { "type": "string", "description": "Data inicial YYYY-MM-DD." },
-                    "end_date": { "type": "string", "description": "Data final YYYY-MM-DD." }
+                    "top_n": {"type": "integer", "description": "Número de itens (padrão 10)."},
+                    "start_date": {"type": "string", "description": "Data inicial YYYY-MM-DD."},
+                    "end_date":   {"type": "string", "description": "Data final YYYY-MM-DD."},
+                    "category":   {"type": "string", "description": "Filtro de categoria: bebidas, cervejas, destilados, vinhos, sucos, alimentos, pratos, dayuse. Obrigatório quando o usuário especificar tipo de produto."}
                 },
                 "required": ["restaurant_name"]
             }

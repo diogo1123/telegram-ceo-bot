@@ -648,47 +648,103 @@ def get_revenue(restaurant_name, start_date=None, end_date=None):
     dt_str = start_date if start_date else "ontem"
     return f"Faturamento total de {rest['name']} ({dt_str}): {fmt_brl(total)}"
 
-def get_top_selling_items(restaurant_name, top_n=5, start_date=None, end_date=None):
+# Mapeamento de termos naturais → grupo do sistema
+_CATEGORY_MAP = {
+    'bebidas':    'BEBIDAS',
+    'drinks':     'BEBIDAS',
+    'drink':      'BEBIDAS',
+    'bar':        'BEBIDAS',
+    'cerveja':    'CERVEJAS',
+    'cervejas':   'CERVEJAS',
+    'destilado':  'DESTILADOS',
+    'destilados': 'DESTILADOS',
+    'dose':       'DOSE',
+    'vinho':      'VINHOS',
+    'vinhos':     'VINHOS',
+    'suco':       'SUCOS',
+    'sucos':      'SUCOS',
+    'agua':       'AGUA',
+    'refri':      'AGUA',
+    'refrigerante': 'AGUA',
+    'alimentos':  'ALIMENTOS',
+    'comida':     'ALIMENTOS',
+    'food':       'ALIMENTOS',
+    'prato':      'ALIMENTOS',
+    'pratos':     'ALIMENTOS',
+    'porcao':     'ALIMENTOS',
+    'porcoes':    'ALIMENTOS',
+    'frutos do mar': 'ALIMENTOS',
+    'sobremesas': 'ALIMENTOS',
+    'saladas':    'ALIMENTOS',
+    'dayuse':     'TAXAS',
+    'day use':    'TAXAS',
+    'taxa':       'TAXAS',
+}
+
+def _row_matches_category(row: dict, category_filter: str) -> bool:
+    """Verifica se a linha de venda pertence à categoria solicitada."""
+    cat = category_filter.strip().lower()
+    mapped = _CATEGORY_MAP.get(cat, cat.upper())
+    grupo   = str(row.get('grupo', '')).upper()
+    subgrupo = str(row.get('subgrupo', '')).upper()
+    return mapped in grupo or mapped in subgrupo
+
+def get_top_selling_items(restaurant_name, top_n=10, start_date=None, end_date=None, category=None):
+    """Ranking de produtos mais vendidos, com filtro opcional por categoria (bebidas, alimentos, cervejas, etc.)."""
     rest = find_restaurant_files(restaurant_name)
     data = fetch_sales_data(rest['id'], start_date, end_date)
+
+    if category:
+        data = [r for r in data if _row_matches_category(r, category)]
+
     sales_map = {}
     for row in data:
         n = row.get("nome", "")
         v = safe_float(row.get("valor", 0))
         q = safe_float(row.get("qtde", 0))
+        g = row.get("grupo", "")
+        s = row.get("subgrupo", "")
         if n:
             if n not in sales_map:
-                sales_map[n] = {'qty': 0, 'rev': 0}
+                sales_map[n] = {'qty': 0, 'rev': 0, 'grupo': g, 'subgrupo': s}
             sales_map[n]['qty'] += q
             sales_map[n]['rev'] += v
-    items = list(sales_map.items())
-    items.sort(key=lambda x: x[1]['rev'], reverse=True)
-    dt_str = start_date if start_date else "ontem"
-    res = f"Top {top_n} mais vendidos de {rest['name']} ({dt_str}):\n"
+    items = sorted(sales_map.items(), key=lambda x: x[1]['rev'], reverse=True)
+    dt_str = f"{start_date} a {end_date}" if end_date and end_date != start_date else (start_date or "hoje")
+    cat_label = f" — categoria: {category}" if category else ""
+    res = f"📊 **TOP {min(int(top_n), len(items))} MAIS VENDIDOS — {rest['name']}**{cat_label}\n"
+    res += f"📅 {dt_str}\n\n"
+    total_cat = sum(v['rev'] for _, v in items)
     for k, v in items[:int(top_n)]:
-        res += f"- {k}: {v['qty']} unid -> {fmt_brl(v['rev'])}\n"
+        pct = (v['rev'] / total_cat * 100) if total_cat else 0
+        res += f"• *{k}* ({v['subgrupo'] or v['grupo']}): {v['qty']:g} unid → {fmt_brl(v['rev'])} ({pct:.1f}%)\n"
+    if not items:
+        res += f"Nenhum produto encontrado para categoria '{category}'.\n"
     return res
 
 def search_sales(restaurant_name, query, start_date=None, end_date=None):
     rest = find_restaurant_files(restaurant_name)
     data = fetch_sales_data(rest['id'], start_date, end_date)
-    
+
     grouped = {}
     for row in data:
-        n = row.get("nome", "")
-        if match_query(query, n):
-            if n not in grouped: grouped[n] = {'qty': 0, 'val': 0.0}
+        n     = row.get("nome", "")
+        grupo = row.get("grupo", "")
+        sub   = row.get("subgrupo", "")
+        # Filtra por nome OU grupo OU subgrupo
+        if match_query(query, n) or match_query(query, grupo) or match_query(query, sub):
+            if n not in grouped: grouped[n] = {'qty': 0, 'val': 0.0, 'sub': sub}
             grouped[n]['qty'] += safe_float(row.get('qtde', 0))
             grouped[n]['val'] += safe_float(row.get('valor', 0))
 
-            
     dt_str = start_date if start_date else "ontem"
-    if not grouped: 
+    if not grouped:
         return f"Nenhuma venda encontrada para '{query}' em {rest['name']} ({dt_str})."
-        
+
     res = f"Vendas para '{query}' em {rest['name']} ({dt_str}):\n"
-    for k, v in grouped.items():
-        res += f"- {k}: {v['qty']} unid -> {fmt_brl(v['val'])}\n"
+    for k, v in sorted(grouped.items(), key=lambda x: -x[1]['val']):
+        sub = f" ({v['sub']})" if v.get('sub') else ""
+        res += f"- {k}{sub}: {v['qty']:g} unid -> {fmt_brl(v['val'])}\n"
     return res
 
 def get_stock(restaurant_name, query):
