@@ -722,29 +722,53 @@ def get_top_selling_items(restaurant_name, top_n=10, start_date=None, end_date=N
         res += f"Nenhum produto encontrado para categoria '{category}'.\n"
     return res
 
+_SEARCH_STOP = {
+    'pratos', 'prato', 'com', 'que', 'tem', 'tem', 'leva', 'levam', 'tem', 'contem',
+    'de', 'do', 'da', 'dos', 'das', 'em', 'no', 'na', 'nos', 'nas',
+    'um', 'uma', 'uns', 'umas', 'o', 'a', 'os', 'as', 'e', 'ou',
+    'vendas', 'venda', 'vendemos', 'vendeu', 'quanto', 'quantos', 'quanta',
+    'itens', 'item', 'produto', 'produtos', 'ingrediente', 'ingredientes',
+}
+
+def _extract_search_keywords(query: str) -> list:
+    """Extrai palavras-chave relevantes da query, removendo stop words."""
+    words = normalize_text(query).split()
+    keywords = [w for w in words if w not in _SEARCH_STOP and len(w) > 2]
+    return keywords if keywords else words  # fallback: usa tudo se nada sobrar
+
 def search_sales(restaurant_name, query, start_date=None, end_date=None):
     rest = find_restaurant_files(restaurant_name)
     data = fetch_sales_data(rest['id'], start_date, end_date)
+
+    # Extrai só as palavras-chave (ignora "pratos com", "que leva", etc.)
+    keywords = _extract_search_keywords(query)
 
     grouped = {}
     for row in data:
         n     = row.get("nome", "")
         grupo = row.get("grupo", "")
         sub   = row.get("subgrupo", "")
-        # Filtra por nome OU grupo OU subgrupo
-        if match_query(query, n) or match_query(query, grupo) or match_query(query, sub):
+        n_norm = normalize_text(n)
+        g_norm = normalize_text(grupo)
+        s_norm = normalize_text(sub)
+        # Aceita linha se QUALQUER keyword aparece no nome, grupo ou subgrupo
+        if any(kw in n_norm or kw in g_norm or kw in s_norm for kw in keywords):
             if n not in grouped: grouped[n] = {'qty': 0, 'val': 0.0, 'sub': sub}
             grouped[n]['qty'] += safe_float(row.get('qtde', 0))
             grouped[n]['val'] += safe_float(row.get('valor', 0))
 
-    dt_str = start_date if start_date else "ontem"
+    dt_str = f"{start_date} a {end_date}" if end_date and end_date != start_date else (start_date or "hoje")
     if not grouped:
-        return f"Nenhuma venda encontrada para '{query}' em {rest['name']} ({dt_str})."
+        return f"Nenhuma venda encontrada para '{query}' em {rest['name']} no período {dt_str}."
 
-    res = f"Vendas para '{query}' em {rest['name']} ({dt_str}):\n"
+    total_val = sum(v['val'] for v in grouped.values())
+    total_qty = sum(v['qty'] for v in grouped.values())
+    res  = f"📊 **Vendas — '{query}' — {rest['name']}**\n📅 {dt_str}\n\n"
+    res += f"**Total: {total_qty:g} unid → {fmt_brl(total_val)}**\n\n"
     for k, v in sorted(grouped.items(), key=lambda x: -x[1]['val']):
-        sub = f" ({v['sub']})" if v.get('sub') else ""
-        res += f"- {k}{sub}: {v['qty']:g} unid -> {fmt_brl(v['val'])}\n"
+        sub_label = f" ({v['sub']})" if v.get('sub') else ""
+        pct = v['val'] / total_val * 100 if total_val else 0
+        res += f"• *{k}*{sub_label}: {v['qty']:g} unid → {fmt_brl(v['val'])} ({pct:.1f}%)\n"
     return res
 
 def get_stock(restaurant_name, query):
