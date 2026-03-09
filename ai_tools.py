@@ -309,7 +309,9 @@ def fetch_sales_data(rest_id, start_date=None, end_date=None):
         r = session.get(SALES_URL, params=s_params)
         if r.status_code == 200:
             d = r.json()
-            if d: print(f"[fetch_sales_data] campos: {list(d[0].keys())}")
+            if d:
+                grupos = sorted(set(f"{x.get('grupo','')}|{x.get('subgrupo','')}" for x in d))
+                print(f"[fetch_sales_data] grupos únicos ({len(d)} linhas): {grupos[:30]}")
             return d
     except: pass
     return []
