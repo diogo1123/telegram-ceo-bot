@@ -83,14 +83,14 @@ tools = [
         "type": "function",
         "function": {
             "name": "search_sales",
-            "description": "Procura pelas vendas ou quantidade vendida de um item específico (ex: Day Use) num período.",
+            "description": "Busca vendas de produtos por nome ou ingrediente. Use quando pedirem: 'quanto vendemos de X', 'pratos com camarão', 'vendas de cerveja', 'quanto faturamos com peixe'. O campo query é o nome do produto ou ingrediente (ex: 'camarão', 'heineken', 'moqueca'). Também filtra por grupo/subgrupo do sistema.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "restaurant_name": {"type": "string"},
-                    "query": {"type": "string", "description": "Nome do produto a buscar, ex: Cerveja, Day Use, Vinho."},
-                    "start_date": { "type": "string", "description": "Data inicial YYYY-MM-DD." },
-                    "end_date": { "type": "string", "description": "Data final YYYY-MM-DD." }
+                    "query": {"type": "string", "description": "Nome do produto ou ingrediente a buscar (ex: camarão, heineken, moqueca, peixe)."},
+                    "start_date": {"type": "string", "description": "Data inicial YYYY-MM-DD."},
+                    "end_date":   {"type": "string", "description": "Data final YYYY-MM-DD."}
                 },
                 "required": ["restaurant_name", "query"]
             }
@@ -1160,11 +1160,14 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
 
     # Anti-hallucination guard: keywords that indicate data was requested
     DATA_KEYWORDS = [
-        "faturamento", "receita", "vendas", "venda", "estoque", "despesa",
-        "custo", "cmv", "markup", "margem", "lucro", "compras", "ficha",
-        "ingrediente", "insumo", "fornecedor", "auditoria", "caixa",
-        "pagamento", "comissão", "fiscal", "nota", "dre", "fluxo",
-        "plano", "ranking", "meta", "relatório", "relatório"
+        "faturamento", "receita", "vendas", "venda", "vendemos", "vendeu",
+        "estoque", "despesa", "custo", "cmv", "markup", "margem", "lucro",
+        "compras", "ficha", "ingrediente", "insumo", "fornecedor", "auditoria",
+        "caixa", "pagamento", "comissão", "fiscal", "nota", "dre", "fluxo",
+        "plano", "ranking", "meta", "relatório", "quanto", "quantos",
+        "quanto vendemos", "quanto faturamos", "quanto gastamos",
+        "pratos", "drinks", "bebidas", "cervejas", "mais vendidos",
+        "cancelamentos", "cancelamento", "avaliações", "reviews",
     ]
     user_lower = user_message.lower()
     is_data_request = any(kw in user_lower for kw in DATA_KEYWORDS)
