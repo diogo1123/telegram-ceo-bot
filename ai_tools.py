@@ -32,6 +32,7 @@ CASH_BOOK_URL = "https://aws.netcontroll.com.br/netweb/api/v1/financeiro/livro-c
 DASHBOARD_RESUMO_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/venda/produto/periodo"  # Portal: #/dashboard/resumo (base: vendas + despesas combinadas)
 DASHBOARD_COMPRAS_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/entrada-mercadoria/periodo"  # Portal: #/dashboard/compra
 BALANCETE_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/balancete"                # Portal: #/relatorio/balancete
+PRODUCT_FISCAL_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/listagem-produto-fiscal"  # Portal: #/relatorio/listagem-produto-fiscal
 BRASILAPI_NCM_URL = "https://brasilapi.com.br/api/ncm/v1/{}"
 
 
@@ -5862,5 +5863,172 @@ def get_watchdog_consolidated(restaurant_name=None):
         return "🐕 **CÃO DE GUARDA:** Tudo sob controle! Nenhum alerta de preço ou desvio crítico detectado nas últimas 24h. ✅"
         
     return "\n\n".join(reports)[:8000]
+
+def get_fiscal_product_audit(restaurant_name):
+    """
+    Audita o cadastro fiscal dos produtos via endpoint listagem-produto-fiscal.
+    Verifica NCM, CEST, CST/CSOSN, CFOP, alíquotas e detecta produtos com tributação incorreta
+    ou cadastro fiscal incompleto que pode gerar erros na NFC-e e multas fiscais.
+    """
+    rest = find_restaurant_files(restaurant_name)
+    session = get_session_for_rest(rest['id'])
+    if not session:
+        return "Erro de autenticação no portal."
+
+    try:
+        resp = session.get(PRODUCT_FISCAL_URL)
+        if resp.status_code != 200:
+            return f"Erro ao acessar listagem fiscal (HTTP {resp.status_code}). Verifique se o endpoint está disponível para {rest['name']}."
+
+        products = resp.json()
+        if not isinstance(products, list) or not products:
+            # Try wrapped response
+            if isinstance(products, dict):
+                products = products.get('data') or products.get('items') or products.get('produtos') or []
+            if not products:
+                return f"Nenhum produto fiscal encontrado para {rest['name']}."
+
+        total = len(products)
+        sem_ncm = []
+        ncm_invalido = []
+        sem_cest = []
+        sem_cst = []
+        sem_cfop = []
+        ncm_semantico = []
+        aliquota_zero = []    # produtos que têm NCM mas alíquota zerada (suspeito)
+        ok_count = 0
+
+        MAX_LOOKUPS = 15
+        lookup_count = 0
+
+        for p in products:
+            nome = str(p.get('nome') or p.get('descricao') or p.get('produto') or '').strip().upper()
+            if not nome:
+                continue
+
+            ncm  = str(p.get('ncm') or p.get('codigoNcm') or '').strip().replace('.', '').replace('-', '')
+            cest = str(p.get('cest') or p.get('codigoCest') or '').strip()
+            cst  = str(p.get('cst') or p.get('cstIcms') or p.get('csosn') or p.get('situacaoTributaria') or '').strip()
+            cfop = str(p.get('cfop') or p.get('codigoCfop') or '').strip()
+            aliq = safe_float(p.get('aliquotaIcms') or p.get('aliquota') or p.get('icms') or 0)
+            grupo = str(p.get('nomeSubgrupo') or p.get('subgrupo') or p.get('grupo') or '').strip()
+            ativo = p.get('ativo', True)
+
+            if not ativo:
+                continue
+
+            # ── 1. NCM ausente ou inválido ────────────────────────────────────
+            if not ncm or ncm in ('0', 'None', ''):
+                sem_ncm.append(f"❌ **NCM Ausente**: {nome} (Grupo: {grupo or 'N/A'})")
+                continue
+
+            if len(ncm) != 8 or not ncm.isdigit():
+                ncm_invalido.append(f"⚠️ **NCM Inválido ({ncm})**: {nome}")
+                continue
+
+            # ── 2. CEST ausente (obrigatório para substituição tributária) ────
+            if not cest or cest in ('0', 'None', ''):
+                sem_cest.append(f"🟡 **CEST Ausente**: {nome} (NCM: {ncm})")
+
+            # ── 3. CST/CSOSN ausente ──────────────────────────────────────────
+            if not cst or cst in ('0', 'None', ''):
+                sem_cst.append(f"🟡 **CST/CSOSN Ausente**: {nome} (NCM: {ncm})")
+
+            # ── 4. CFOP ausente ───────────────────────────────────────────────
+            if not cfop or cfop in ('0', 'None', ''):
+                sem_cfop.append(f"🟡 **CFOP Ausente**: {nome} (NCM: {ncm})")
+
+            # ── 5. Alíquota ICMS zerada mas produto tributável ────────────────
+            # Capítulos que tipicamente têm ICMS > 0 no regime normal
+            typically_taxed = ['22', '17', '18', '19', '20', '21', '09', '10', '11']
+            if aliq == 0 and ncm[:2] in typically_taxed:
+                aliquota_zero.append(f"🔴 **Alíquota ICMS Zerada**: {nome} (NCM: {ncm}, cap. {ncm[:2]})")
+
+            # ── 6. Validação semântica NCM × Grupo (sem HTTP) ─────────────────
+            expected = _get_expected_chapters_for_group(grupo)
+            if expected and ncm[:2] not in expected:
+                entry = {'nome': nome, 'grupo': grupo, 'ncm': ncm, 'chapter': ncm[:2], 'desc': None}
+                if lookup_count < MAX_LOOKUPS:
+                    try:
+                        entry['desc'] = lookup_ncm_description(ncm)
+                        lookup_count += 1
+                    except:
+                        pass
+                ncm_semantico.append(entry)
+            else:
+                ok_count += 1
+
+        # ── Relatório ──────────────────────────────────────────────────────────
+        report = []
+        report.append(f"🛡️ **AUDITORIA FISCAL DE PRODUTOS — {rest['name'].upper()}**")
+        report.append(f"📦 Total de Produtos Fiscais Analisados: {total}")
+        report.append("")
+
+        critical = len(sem_ncm) + len(ncm_invalido) + len(aliquota_zero)
+        attention = len(sem_cest) + len(sem_cst) + len(sem_cfop) + len(ncm_semantico)
+        report.append(f"🔴 Problemas Críticos: {critical}  |  🟡 Atenção: {attention}  |  ✅ OK: {ok_count}")
+        report.append("")
+
+        if sem_ncm:
+            report.append(f"🚨 **NCM AUSENTE ({len(sem_ncm)} produtos):**")
+            for item in sem_ncm[:15]:
+                report.append(f"  {item}")
+            if len(sem_ncm) > 15:
+                report.append(f"  ... e mais {len(sem_ncm) - 15} sem NCM.")
+            report.append("")
+
+        if ncm_invalido:
+            report.append(f"⚠️ **NCM COM FORMATO INVÁLIDO ({len(ncm_invalido)} produtos):**")
+            for item in ncm_invalido[:10]:
+                report.append(f"  {item}")
+            report.append("")
+
+        if aliquota_zero:
+            report.append(f"🔴 **ALÍQUOTA ICMS ZERADA EM PRODUTO TIPICAMENTE TRIBUTÁVEL ({len(aliquota_zero)}):**")
+            for item in aliquota_zero[:10]:
+                report.append(f"  {item}")
+            report.append("")
+
+        if ncm_semantico:
+            report.append(f"🧾 **NCM INCOMPATÍVEL COM GRUPO ({len(ncm_semantico)} produtos):**")
+            for a in ncm_semantico[:12]:
+                desc_str = f' → RF: "{a["desc"]}"' if a.get('desc') else ''
+                report.append(f"  🔴 {a['nome']}")
+                report.append(f"     Grupo: {a['grupo']} | NCM: {a['ncm']} (cap. {a['chapter']}){desc_str}")
+            if len(ncm_semantico) > 12:
+                report.append(f"  ... e mais {len(ncm_semantico) - 12} com NCM suspeito.")
+            report.append("")
+
+        if sem_cest:
+            report.append(f"🟡 **SEM CEST ({len(sem_cest)} produtos)** — obrigatório p/ substituição tributária:")
+            for item in sem_cest[:8]:
+                report.append(f"  {item}")
+            if len(sem_cest) > 8:
+                report.append(f"  ... e mais {len(sem_cest) - 8}.")
+            report.append("")
+
+        if sem_cst:
+            report.append(f"🟡 **SEM CST/CSOSN ({len(sem_cst)} produtos):**")
+            for item in sem_cst[:8]:
+                report.append(f"  {item}")
+            report.append("")
+
+        if sem_cfop:
+            report.append(f"🟡 **SEM CFOP ({len(sem_cfop)} produtos):**")
+            for item in sem_cfop[:8]:
+                report.append(f"  {item}")
+            report.append("")
+
+        if critical == 0 and attention == 0:
+            report.append("✅ Todos os produtos estão com cadastro fiscal completo e NCMs compatíveis.")
+
+        report.append("---")
+        report.append("💡 *NCM errado ou ausente gera rejeição de NFC-e, tributação indevida e risco de autuação fiscal. CEST ausente impede recolhimento correto de ICMS-ST.*")
+
+        return "\n".join(report)
+
+    except Exception as e:
+        return f"Erro na auditoria fiscal de produtos: {str(e)}"
+
 
 # --- FIM DO ARQUIVO ---

@@ -782,6 +782,20 @@ tools = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_fiscal_product_audit",
+            "description": "Audita o cadastro fiscal dos produtos via listagem-produto-fiscal. Verifica NCM (correto, ausente, inválido, incompatível com o grupo), CEST, CST/CSOSN, CFOP e alíquotas de ICMS. Detecta produtos com tributação incorreta ou cadastro fiscal incompleto que pode gerar rejeição de NFC-e e multas fiscais. Use quando o CEO perguntar 'audite os impostos', 'verifique os NCMs', 'os produtos estão cadastrados corretamente no fiscal', 'classificação fiscal', 'listagem fiscal', 'tributação dos produtos'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant_name": {"type": "string", "description": "Nome do restaurante (Nauan, Milagres, Ahau)."}
+                },
+                "required": ["restaurant_name"]
+            }
+        }
     }
 ]
 
@@ -1146,6 +1160,7 @@ Antes de escrever cada número na resposta, pergunte mentalmente: "Este valor es
 - Precificação dinâmica → get_dynamic_pricing_suggestions
 - Escala de RH → get_predictive_hr_scale
 - Economia fiscal PIS/COFINS → get_tax_combo_suggestions
+- Auditoria fiscal de produtos (NCM, CEST, CST, CFOP, alíquota, cadastro fiscal) → get_fiscal_product_audit
 
 Se período não especificado → assuma hoje ({today}), reafirme na resposta.
 Se pedir as 3 casas → chame get_scenario para cada uma separadamente.
@@ -1357,6 +1372,8 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
                     ))
                 elif function_name == "get_pricing_advisor":
                     function_response = str(ai_tools.get_pricing_advisor(**function_args))
+                elif function_name == "get_fiscal_product_audit":
+                    function_response = str(ai_tools.get_fiscal_product_audit(**function_args))
             except Exception as e:
                 function_response = f"Erro ao executar a ferramenta: {e}"
             
