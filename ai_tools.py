@@ -225,12 +225,35 @@ def fmt_pct(v, decimals=1):
 def match_query(query, target):
     """
     Checks if ALL words in the normalized query exist in the normalized target.
-    This allows 'agua gas' to safely match 'AGUA MINERAL COM GAS'.
+    If exact words are not found, falls back to fuzzy matching using difflib
+    to tolerate typos.
     """
-    q_norm = normalize_text(query).split()
+    import difflib
+    q_norm = normalize_text(query)
     t_norm = normalize_text(target)
+    
     if not q_norm: return True # Empty query matches anything
-    return all(word in t_norm for word in q_norm)
+    
+    q_words = q_norm.split()
+    t_words = t_norm.split()
+    
+    # 1. Exact word matches
+    if all(word in t_norm for word in q_words):
+        return True
+        
+    # 2. Fuzzy word-by-word matching
+    # Checks if EVERY word in the query has at least one close match (> 0.75 ratio) in the target words.
+    for q_word in q_words:
+        if len(q_word) <= 2:
+            # For tiny words like "de", "com", require exact match
+            if q_word not in t_words: return False
+            continue
+            
+        best_ratio = max([difflib.SequenceMatcher(None, q_word, t_word).ratio() for t_word in t_words] + [0])
+        if best_ratio < 0.75: 
+            return False
+            
+    return True
 
 
 # Stop-words que não ajudam no match de pratos (ignoradas na pontuação)
@@ -300,81 +323,105 @@ def get_session_for_rest(rest_id):
 def fetch_sales_data(rest_id, start_date=None, end_date=None):
     if not start_date: start_date = datetime.now().strftime('%Y-%m-%d')
     if not end_date: end_date = start_date
-    session = get_session_for_rest(rest_id)
-    if not session: return []
-    s_date = f"{start_date}T03:00:00.000Z"
-    e_date = f"{end_date}T03:00:00.000Z"
-    s_params = {'DataInicial': s_date, 'DataFinal': e_date, 'IncluirCusto': 'true'}
-    try:
-        r = session.get(SALES_URL, params=s_params)
-        if r.status_code == 200:
-            d = r.json()
-            if d:
-                grupos = sorted(set(f"{x.get('grupo','')}|{x.get('subgrupo','')}" for x in d))
-                print(f"[fetch_sales_data] grupos únicos ({len(d)} linhas): {grupos[:30]}")
-            return d
-    except: pass
-    return []
+    
+    from cache_engine import get_cached
+    
+    def _live_fetch(r_id, sd, ed):
+        session = get_session_for_rest(r_id)
+        if not session: return []
+        s_date = f"{sd}T03:00:00.000Z"
+        e_date = f"{ed}T03:00:00.000Z"
+        s_params = {'DataInicial': s_date, 'DataFinal': e_date, 'IncluirCusto': 'true'}
+        try:
+            r = session.get(SALES_URL, params=s_params)
+            if r.status_code == 200:
+                d = r.json()
+                if d:
+                    grupos = sorted(set(f"{x.get('grupo','')}|{x.get('subgrupo','')}" for x in d))
+                    print(f"[fetch_sales_data] LOW LEVEL FETCH: {r_id} ({sd} to {ed}). L/R: {len(d)}")
+                return d
+        except: pass
+        return []
+        
+    return get_cached(rest_id, 'sales', start_date, end_date, _live_fetch)
 
 def fetch_expenses_data(rest_id, start_date=None, end_date=None):
-    """Despesas agrupadas por Plano de Contas (categorias: FOLHA, CMV, FIXO, etc.).
-    Portal: /relatorio/financeiro-conta-pagar-plano"""
+    """Despesas agrupadas por Plano de Contas."""
     if not start_date: start_date = datetime.now().strftime('%Y-%m-%d')
     if not end_date: end_date = start_date
-    session = get_session_for_rest(rest_id)
-    if not session: return []
-    s_date = f"{start_date}T03:00:00.000Z"
-    e_date = f"{end_date}T03:00:00.000Z"
-    exp_params = {'DataInicial': s_date, 'DataFinal': e_date, 'TipoDataDespesa': 0}
-    try:
-        r = session.get(EXPENSES_URL, params=exp_params)
-        if r.status_code == 200: return r.json()
-    except: pass
-    return []
+    
+    from cache_engine import get_cached
+    def _live(r_id, sd, ed):
+        session = get_session_for_rest(r_id)
+        if not session: return []
+        s_date = f"{sd}T03:00:00.000Z"
+        e_date = f"{ed}T03:00:00.000Z"
+        exp_params = {'DataInicial': s_date, 'DataFinal': e_date, 'TipoDataDespesa': 0}
+        try:
+            r = session.get(EXPENSES_URL, params=exp_params)
+            if r.status_code == 200: return r.json()
+        except: pass
+        return []
+        
+    return get_cached(rest_id, 'exp_plano', start_date, end_date, _live)
 
 def fetch_expenses_supplier_data(rest_id, start_date=None, end_date=None):
-    """Despesas agrupadas por Fornecedor (ranking: quem recebeu mais).
-    Portal: /relatorio/financeiro-conta-pagar-fornecedor"""
+    """Despesas agrupadas por Fornecedor."""
     if not start_date: start_date = datetime.now().strftime('%Y-%m-%d')
     if not end_date: end_date = start_date
-    session = get_session_for_rest(rest_id)
-    if not session: return []
-    s_date = f"{start_date}T03:00:00.000Z"
-    e_date = f"{end_date}T03:00:00.000Z"
-    params = {'DataInicial': s_date, 'DataFinal': e_date}
-    try:
-        r = session.get(EXPENSES_SUPPLIER_URL, params=params)
-        if r.status_code == 200: return r.json()
-    except: pass
-    return []
+    
+    from cache_engine import get_cached
+    def _live(r_id, sd, ed):
+        session = get_session_for_rest(r_id)
+        if not session: return []
+        s_date = f"{sd}T03:00:00.000Z"
+        e_date = f"{ed}T03:00:00.000Z"
+        params = {'DataInicial': s_date, 'DataFinal': e_date}
+        try:
+            r = session.get(EXPENSES_SUPPLIER_URL, params=params)
+            if r.status_code == 200: return r.json()
+        except: pass
+        return []
+        
+    return get_cached(rest_id, 'exp_forn', start_date, end_date, _live)
 
 def fetch_inbound_data(rest_id, start_date=None, end_date=None):
     if not start_date: start_date = datetime.now().strftime('%Y-%m-%d')
     if not end_date: end_date = start_date
-    session = get_session_for_rest(rest_id)
-    if not session: return []
-    s_date = f"{start_date}T03:00:00.000Z"
-    e_date = f"{end_date}T03:00:00.000Z"
-    params = {'DataInicial': s_date, 'DataFinal': e_date}
-    try:
-        r = session.get(INBOUND_URL, params=params)
-        if r.status_code == 200: return r.json()
-    except: pass
-    return []
+    
+    from cache_engine import get_cached
+    def _live(r_id, sd, ed):
+        session = get_session_for_rest(r_id)
+        if not session: return []
+        s_date = f"{sd}T03:00:00.000Z"
+        e_date = f"{ed}T03:00:00.000Z"
+        params = {'DataInicial': s_date, 'DataFinal': e_date}
+        try:
+            r = session.get(INBOUND_URL, params=params)
+            if r.status_code == 200: return r.json()
+        except: pass
+        return []
+        
+    return get_cached(rest_id, 'inbound', start_date, end_date, _live)
 
 def fetch_cmv_data(rest_id, start_date=None, end_date=None):
     if not start_date: start_date = datetime.now().strftime('%Y-%m-%d')
     if not end_date: end_date = start_date
-    session = get_session_for_rest(rest_id)
-    if not session: return []
-    s_date = f"{start_date}T03:00:00.000Z"
-    e_date = f"{end_date}T03:00:00.000Z"
-    params = {'DataInicial': s_date, 'DataFinal': e_date}
-    try:
-        r = session.get(CMV_URL, params=params)
-        if r.status_code == 200: return r.json()
-    except: pass
-    return []
+    
+    from cache_engine import get_cached
+    def _live(r_id, sd, ed):
+        session = get_session_for_rest(r_id)
+        if not session: return []
+        s_date = f"{sd}T03:00:00.000Z"
+        e_date = f"{ed}T03:00:00.000Z"
+        params = {'DataInicial': s_date, 'DataFinal': e_date}
+        try:
+            r = session.get(CMV_URL, params=params)
+            if r.status_code == 200: return r.json()
+        except: pass
+        return []
+
+    return get_cached(rest_id, 'cmv', start_date, end_date, _live)
 
 def fetch_composition_data(rest_id):
     session = get_session_for_rest(rest_id)
@@ -719,7 +766,10 @@ def get_top_selling_items(restaurant_name, top_n=10, start_date=None, end_date=N
         pct = (v['rev'] / total_cat * 100) if total_cat else 0
         res += f"• *{k}* ({v['subgrupo'] or v['grupo']}): {v['qty']:g} unid → {fmt_brl(v['rev'])} ({pct:.1f}%)\n"
     if not items:
-        res += f"Nenhum produto encontrado para categoria '{category}'.\n"
+        if category:
+            res += f"Nenhum produto encontrado para categoria '{category}'.\n"
+        else:
+            res += f"Nenhum produto encontrado neste período.\n"
     return res
 
 _SEARCH_STOP = {
@@ -5521,5 +5571,265 @@ def get_financial_snapshot(restaurant_name):
 
     except Exception as e:
         return f"Erro ao gerar Raio-X financeiro: {str(e)}"
+
+
+def get_price_spike_alert(restaurant_name=None, threshold_pct=8):
+    """
+    Cão de Guarda: varre as notas de entrada dos últimos 45 dias e alerta
+    quando o preço médio de um ingrediente nas últimas 2 semanas subiu >=
+    threshold_pct% em relação às 4 semanas anteriores.
+
+    Usa média ponderada por quantidade (não apenas o último preço registrado),
+    tornando o alerta muito mais preciso do que uma comparação simples.
+
+    Se restaurant_name for None → verifica TODAS as casas.
+    """
+    try: threshold_pct = float(threshold_pct)
+    except: threshold_pct = 8.0
+
+    now     = datetime.now()
+    today   = now.strftime('%Y-%m-%d')
+    # Janela recente: últimos 15 dias
+    recent_start   = (now - timedelta(days=15)).strftime('%Y-%m-%d')
+    # Janela baseline: 16-45 dias atrás
+    baseline_start = (now - timedelta(days=45)).strftime('%Y-%m-%d')
+    baseline_end   = (now - timedelta(days=16)).strftime('%Y-%m-%d')
+
+    if restaurant_name:
+        targets = [find_restaurant_files(restaurant_name)]
+    else:
+        targets = RESTAURANTS
+
+    all_alerts = []
+
+    for rest in targets:
+        recent_data   = fetch_inbound_data(rest['id'], recent_start, today)
+        baseline_data = fetch_inbound_data(rest['id'], baseline_start, baseline_end)
+
+        def _avg_price_map(data):
+            """Constrói { produto_normalizado: {nome, fornecedor, avg_price, total_qty} }"""
+            agg = {}
+            for row in data:
+                produto = str(row.get('produto', '')).strip()
+                if not produto: continue
+                preco = safe_float(row.get('valorUnitario', 0))
+                qtd   = safe_float(row.get('qtde', 1))
+                if preco <= 0 or qtd <= 0: continue
+                key = normalize_text(produto)
+                if key not in agg:
+                    agg[key] = {
+                        'nome': produto,
+                        'fornecedor': str(row.get('fornecedor', '')).strip(),
+                        'sum_valor': 0.0,
+                        'total_qty': 0.0
+                    }
+                agg[key]['sum_valor']  += preco * qtd
+                agg[key]['total_qty']  += qtd
+            # Compute weighted avg
+            result = {}
+            for k, v in agg.items():
+                if v['total_qty'] > 0:
+                    result[k] = {
+                        'nome':       v['nome'],
+                        'fornecedor': v['fornecedor'],
+                        'avg_price':  v['sum_valor'] / v['total_qty'],
+                        'total_qty':  v['total_qty'],
+                    }
+            return result
+
+        recent_map   = _avg_price_map(recent_data)
+        baseline_map = _avg_price_map(baseline_data)
+
+        for key, rec in recent_map.items():
+            if key not in baseline_map: continue
+            base = baseline_map[key]
+            if base['avg_price'] <= 0: continue
+            variacao = (rec['avg_price'] - base['avg_price']) / base['avg_price'] * 100
+            if variacao >= threshold_pct:
+                all_alerts.append({
+                    'casa':        rest['name'],
+                    'nome':        rec['nome'],
+                    'fornecedor':  rec['fornecedor'],
+                    'preco_base':  base['avg_price'],
+                    'preco_rec':   rec['avg_price'],
+                    'variacao':    variacao,
+                })
+
+    all_alerts.sort(key=lambda x: x['variacao'], reverse=True)
+
+    report = f"🐕 **CÃO DE GUARDA — ALERTAS DE PREÇO (≥{threshold_pct:.0f}%)**\n"
+    report += f"📅 Referência: {baseline_start} → {baseline_end} | Recente: {recent_start} → {today}\n\n"
+
+    if not all_alerts:
+        report += f"✅ Nenhum insumo subiu {threshold_pct:.0f}% ou mais nas últimas 2 semanas. Tudo dentro do normal."
+        return report
+
+    report += f"🚨 **{len(all_alerts)} ALERTA(S) DETECTADO(S):**\n\n"
+    for a in all_alerts[:30]:
+        report += (f"🔺 **{a['nome']}** — {a['casa']}\n"
+                   f"   Fornecedor: {a['fornecedor'] or 'não informado'}\n"
+                   f"   Preço médio anterior: {fmt_brl(a['preco_base'])}/un\n"
+                   f"   Preço médio recente:  {fmt_brl(a['preco_rec'])}/un (+{fmt_pct(a['variacao'])}%)\n\n")
+
+    report += ("💡 _Use o Conselheiro de Precificação para calcular o novo preço de venda "
+               "e proteger sua margem em cada prato afetado._")
+    return report[:8000]
+
+
+def get_pricing_advisor(restaurant_name, ingredient, cost_increase_pct):
+    """
+    Conselheiro de Precificação: dado que um ingrediente subiu X%, calcula
+    o novo preço de venda recomendado para cada prato que leva esse ingrediente,
+    de forma a manter a margem de contribuição atual.
+
+    Lógica:
+      - current_margin  = (preco_venda - custo_porcao) / preco_venda × 100
+      - new_cost_porcao = custo_porcao + (custo_ingrediente × cost_increase_pct / 100)
+      - new_price       = new_cost_porcao / (1 - current_margin / 100)
+      - delta_monthly   = (new_price - current_price) × qty_vendida_30d
+    """
+    try: cost_increase_pct = float(cost_increase_pct)
+    except: cost_increase_pct = 10.0
+
+    rest = find_restaurant_files(restaurant_name)
+    ingr_norm = normalize_text(ingredient)
+
+    # ── 1. Composições: encontrar todos os pratos que usam o ingrediente ─────
+    comp_rows = fetch_composition_data(rest['id'])
+    if not comp_rows:
+        return (f"Fichas técnicas não disponíveis para {rest['name']}. "
+                f"Não é possível calcular o impacto por prato.")
+
+    # dish_map: { compostoNome: { ingredients: [{name, qty, cost}], total_cost } }
+    dish_map = {}
+    for row in comp_rows:
+        dish  = str(row.get('compostoNome', '')).strip()
+        ingr  = str(row.get('composicaoNome', '')).strip()
+        qty   = safe_float(row.get('quantidade', 0))
+        custo = safe_float(row.get('custo', 0))
+        if not dish or not ingr: continue
+        if dish not in dish_map:
+            dish_map[dish] = {'total_cost': 0.0, 'ingredients': []}
+        dish_map[dish]['total_cost'] += custo
+        dish_map[dish]['ingredients'].append({
+            'name': ingr, 'qty': qty, 'custo': custo
+        })
+
+    # Filtrar pratos que contêm o ingrediente
+    affected = {}
+    for dish, info in dish_map.items():
+        for ingr_item in info['ingredients']:
+            if ingr_norm in normalize_text(ingr_item['name']):
+                if dish not in affected:
+                    affected[dish] = {
+                        'dish_name':    dish,
+                        'total_cost':   info['total_cost'],
+                        'ingr_cost':    0.0,   # custo do ingrediente específico no prato
+                    }
+                affected[dish]['ingr_cost'] += ingr_item['custo']
+                break
+
+    if not affected:
+        return (f"Nenhum prato encontrado contendo '{ingredient}' nas fichas técnicas de {rest['name']}.")
+
+    # ── 2. Preço de venda atual — via CMV catalog ─────────────────────────────
+    today      = datetime.now().strftime('%Y-%m-%d')
+    d30        = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    cmv_rows   = fetch_cmv_data(rest['id'], d30, today)
+    price_map  = {}   # { nome_norm: preco_venda }
+    for r in cmv_rows:
+        nome  = str(r.get('nome', '')).strip()
+        preco = safe_float(r.get('preco', 0))
+        if nome and preco > 0:
+            price_map[normalize_text(nome)] = preco
+
+    # Vendas dos últimos 30 dias para quantidade média mensal
+    sales_data = fetch_sales_data(rest['id'], d30, today)
+    qty_map = {}   # { nome_norm: qty_total_30d }
+    for s in sales_data:
+        nome = str(s.get('nome', '')).strip()
+        qtde = safe_float(s.get('qtde', 0))
+        if nome:
+            k = normalize_text(nome)
+            qty_map[k] = qty_map.get(k, 0.0) + qtde
+
+    # ── 3. Calcular novos preços recomendados ─────────────────────────────────
+    results = []
+    for dish_name, info in affected.items():
+        dish_norm    = normalize_text(dish_name)
+        sale_price   = find_best_cost_match(dish_norm, price_map)
+        qty_30d      = find_best_cost_match(dish_norm, qty_map)
+
+        total_cost   = info['total_cost']
+        ingr_cost    = info['ingr_cost']
+
+        if sale_price <= 0 or total_cost <= 0:
+            results.append({
+                'dish':       dish_name,
+                'sale_price': sale_price,
+                'total_cost': total_cost,
+                'ingr_cost':  ingr_cost,
+                'new_price':  None,
+                'delta_mo':   None,
+                'qty_30d':    qty_30d,
+            })
+            continue
+
+        current_margin_pct = (sale_price - total_cost) / sale_price * 100
+
+        # Custo extra do ingrediente devido ao aumento
+        ingr_increase   = ingr_cost * (cost_increase_pct / 100)
+        new_total_cost  = total_cost + ingr_increase
+
+        # Novo preço que mantém a mesma margem
+        if current_margin_pct >= 100:
+            new_price = sale_price  # fallback — margem impossível
+        else:
+            new_price = new_total_cost / (1 - current_margin_pct / 100)
+
+        price_increase = new_price - sale_price
+        delta_monthly  = price_increase * qty_30d   # lucro extra se repassar o aumento
+
+        results.append({
+            'dish':         dish_name,
+            'sale_price':   sale_price,
+            'total_cost':   total_cost,
+            'ingr_cost':    ingr_cost,
+            'new_price':    new_price,
+            'delta_mo':     delta_monthly,
+            'qty_30d':      qty_30d,
+            'margin_pct':   current_margin_pct,
+            'ingr_increase': ingr_increase,
+        })
+
+    results.sort(key=lambda x: abs(x.get('ingr_cost', 0)), reverse=True)
+
+    report  = f"💡 **CONSELHEIRO DE PRECIFICAÇÃO — {rest['name'].upper()}**\n"
+    report += f"🥩 Ingrediente: *{ingredient}* | Alta de custo: *+{fmt_pct(cost_increase_pct)}%*\n"
+    report += f"📅 Base: últimos 30 dias ({d30} a {today})\n\n"
+    report += f"**{len(results)} prato(s) afetado(s):**\n\n"
+
+    for r in results:
+        report += f"🍽️ **{r['dish']}**\n"
+        report += f"   Custo da porção: {fmt_brl(r['total_cost'])} | Venda atual: {fmt_brl(r['sale_price'])}\n"
+        if r.get('margin_pct') is not None:
+            report += f"   Margem atual: {fmt_pct(r['margin_pct'])}%\n"
+        report += f"   Custo do {ingredient} na receita: {fmt_brl(r['ingr_cost'])} → +{fmt_brl(r.get('ingr_increase', 0))} com a alta\n"
+
+        if r['new_price'] is not None:
+            report += f"   🏷️ **Novo preço recomendado: {fmt_brl(r['new_price'])}** (+{fmt_brl(r['new_price'] - r['sale_price'])})\n"
+            if r['qty_30d'] > 0:
+                report += (f"   📈 Impacto mensal se repassar: "
+                           f"+{fmt_brl(r['delta_mo'])} "
+                           f"({r['qty_30d']:.0f} un/mês)\n")
+            else:
+                report += f"   _(Sem dados de venda nos últimos 30 dias)_\n"
+        else:
+            report += f"   ⚠️ Preço de venda não cadastrado — não foi possível calcular o novo preço.\n"
+        report += "\n"
+
+    report += ("_Nota: O novo preço foi calculado para preservar a margem de contribuição atual. "
+               "Se preferir absorver parte do aumento, ajuste manualmente._")
+    return report[:8000]
 
 

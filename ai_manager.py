@@ -37,11 +37,11 @@ def add_to_history(chat_id, role, content):
     key = str(chat_id)
     if key not in memory:
         memory[key] = []
-    # Truncate content to avoid token overload (max 500 chars per entry)
-    truncated = content[:500] if content else ""
+    # Memória Circunstancial: Preservar dados e informações passadas para as próximas perguntas
+    truncated = content[:1500] if content else ""
     memory[key].append({"role": role, "content": truncated})
-    # Keep only last MAX_HISTORY * 2 entries (pairs of user+assistant)
-    memory[key] = memory[key][-(MAX_HISTORY * 2):]
+    # Keep up to 6 prior interactions (3 questions and 3 answers)
+    memory[key] = memory[key][-(6):]
     save_memory(memory)
 
 tools = [
@@ -279,7 +279,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_supplier_inflation",
-            "description": "Rastreia aumentos ou reduções ocultas de preço de fornecedores comparando notas fiscais recentes vs anteriores. Alerta se algum insumo subiu mais de 3%.",
+            "description": "Rastreia aumentos ou reduções ocultas de preço de fornecedores comparando notas fiscais recentes vs anteriores. Use SEMPRE que o CEO perguntar sobre 'fornecedor com CMV subindo', 'inflação de insumos', 'quem está cobrando mais caro' ou 'aumento de preços'.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -474,7 +474,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_supplier_report",
-            "description": "Gera um ranking dos maiores fornecedores e um detalhamento de títulos (auditoria) para um período, conforme solicitado pelo CEO.",
+            "description": "Gera ranking dos maiores fornecedores (quem mais recebeu pagamentos) e detalhamento de títulos para um período. Use para perguntas como 'top fornecedores', 'quem gastou mais', ou listar despesas por fornecedor.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -737,6 +737,37 @@ tools = [
                 "required": ["restaurant_name"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_price_spike_alert",
+            "description": "Cão de Guarda: detecta automaticamente ingredientes que subiram de preço nas notas de entrada recentes (últimas 2 semanas vs mês anterior). Use quando o CEO perguntar 'algum insumo subiu?', 'alertas de preço', 'o que ficou mais caro', 'Cão de Guarda'. Padrão: alerta para altas ≥8%.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant_name": {"type": "string", "description": "Nome do restaurante. Se omitido, verifica todas as casas."},
+                    "threshold_pct":   {"type": "number",  "description": "Percentual mínimo de alta para alertar (padrão: 8)."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pricing_advisor",
+            "description": "Conselheiro de Precificação: dado que um ingrediente subiu X%, calcula o novo preço de venda recomendado para cada prato que leva esse ingrediente, mantendo a margem de contribuição atual. Mostra o impacto mensal no faturamento. Use quando o CEO perguntar 'o camarão subiu 15%, preciso reajustar o preço', 'quanto devo cobrar agora pelo prato X', 'proteger margem com aumento de custo'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant_name":    {"type": "string", "description": "Nome do restaurante."},
+                    "ingredient":         {"type": "string", "description": "Nome do ingrediente que ficou mais caro (ex: camarão, filé mignon, heineken)."},
+                    "cost_increase_pct":  {"type": "number",  "description": "Percentual de alta no custo do ingrediente (ex: 15 para +15%)."}
+                },
+                "required": ["restaurant_name", "ingredient", "cost_increase_pct"]
+            }
+        }
     }
 ]
 
@@ -986,27 +1017,27 @@ IMPORTANTE: Cite os valores EXATOS que vieram nos dados. Não estime nem calcule
 - KPI mais preocupante em cada casa: ação recomendada por unidade""")
 
     # Universal closing — always present
+    # Universal closing — always present
     instructions.append("""
 ---
-ENCERRE SEMPRE COM:
-💡 **PLANO DE AÇÃO CEO — TOP 5 AÇÕES:**
+SOBRE O PLANO DE AÇÃO CEO:
+Se a pergunta do usuário for uma solicitação ampla de diagnóstico (ex: DRE, cenário completo, balancete ou relatório estrutural), VOCÊ DEVE encerrar sua resposta com a seção:
+💡 **PLANO DE AÇÃO CEO — TOP AÇÕES:** (no máximo 5).
 
-⚠️ **REGRA DE OURO PARA O PLANO DE AÇÃO**:
-1) Se ABSOLUTAMENTE NENHUM dado (0 dados) foi retornado pelas ferramentas para o período analisado (ou seja, tudo veio como 'indisponível' ou 'vazio'), responda APENAS: "⚠️ Plano de Ação suspenso: Sem dados disponíveis neste recorte para formular ações concretas." e encerre.
-2) Se HOUVER PELO MENOS UM dado real válido — incluindo avaliações Google (nota, temas, reviews negativos), faturamento, cancelamentos, despesas ou vendas — você DEVE formular ações focadas EXCLUSIVAMENTE nos dados que retornaram, sem inventar sobre o que faltou.
-   Exemplos de dado válido: nota Google 4.2⭐, tema "atendimento" com 3 críticas negativas, cancelamento de R$800, faturamento de R$42k.
+⚠️ **COMPORTAMENTO PARA PERGUNTAS DIRETAS**:
+Se a pergunta do usuário for PONTUAL/DIRETA (ex: "quais os drinks mais vendidos?", "qual o fornecedor mais caro?", "qual a despesa de energia?"), RESPONDA APENAS A PERGUNTA DE FORMA OBJETIVA E AMIGÁVEL. Você NÃO DEVE incluir a seção "PLANO DE AÇÃO" para respostas diretas, a não ser que o usuário explicitamente peça um plano de ação para isso ou se for encontrado algum alerta grave (falha de CMV drástica, fraude).
 
-Regra: cada ação DEVE citar o dado real dos dados recebidos que a justifica.
-✓ "Produto X custou R$ 9,20 na última compra (dado da ferramenta). Preço atual R$ 12,00 = markup 1,3x, abaixo do mínimo 2,5x. Ajustar para R$ 23,00 — gerente — hoje."
-✗ "Revisar preços" — proibido. Ação sem dado que a suporte = não enviar.
-✗ "O custo provavelmente subiu" — proibido usar "provavelmente" ou "deve ter".
+⚠️ **REGRA DE OURO PARA DADOS VAZIOS/INDISPONÍVEIS**:
+Se a ferramenta chamada não retornou NENHUM dado relevante para responder, apenas RESPONDA natural e amigavelmente ao usuário o que ocorreu (Ex: "Não localizei as notas de compra para este fornecedor nos últimos 30 dias."). 
+Após sua resposta amigável, VOCÊ ESTÁ PROIBIDO de inventar um Plano de Ação com conselhos genéricos sobre a falta de dados (ex: "Oriente sua equipe a preencher o sistema"). Apenas informe que não há o dado.
 
-Para cada ação:
-- Dado real que justifica (cite o número exato)
-- O que fazer (ação concreta)
-- Responsável (nome/cargo se veio nos dados, senão "gerente responsável")
-- Prazo
-- Impacto em R$ (SÓ se calculável a partir dos dados reais — senão omita o valor)""")
+⚠️ **REGRA DE OURO SE FOR GERAR PLANO DE AÇÃO**:
+Para cada ação criada, ela DEVE ser focada apenas em Citar o número recebido. 
+- Dado real que justifica (cite número extraído da ferramenta).
+- O que fazer (ação exata).
+- Responsável.
+- Prazos e Impacto estimado em R$.
+Proibido usar "provavelmente".""")
 
     return "\n".join(instructions)
 
@@ -1014,6 +1045,9 @@ Para cada ação:
 def _build_system_prompt(current_restaurant):
     today = datetime.now().strftime('%Y-%m-%d')
     return f"""Você é o Consultor Estratégico CEO do Grupo Milagres (Nauan Beach Club, Milagres do Toque, Ahau Arte e Cozinha). Restaurante atual: {current_restaurant}. Hoje: {today}.
+
+🧠 **MEMÓRIA CIRCUNSTANCIAL (CONTEXTO DA CONVERSA)**:
+Você tem acesso ao histórico de mensagens acima! Se o usuário fizer uma pergunta de continuação (ex: "e do mês passado?", "e do Ahau?", "quem foi o maior?"), VOCÊ DEVE HERDAR o contexto da conversa anterior (como as datas analisadas, o restaurante que estava sendo consultado, o insumo em foco) para preencher os parâmetros das suas ferramentas e não pedir para ele repetir.
 
 Suas fontes de dados principais no portal NetControll são:
 - Vendas por Produto: https://portal.netcontroll.com.br/#/relatorio/venda-produto
@@ -1168,6 +1202,8 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
         "quanto vendemos", "quanto faturamos", "quanto gastamos",
         "pratos", "drinks", "bebidas", "cervejas", "mais vendidos",
         "cancelamentos", "cancelamento", "avaliações", "reviews",
+        "cão de guarda", "alerta de preço", "preço subiu", "ficou mais caro",
+        "conselheiro", "reajustar preço", "novo preço", "proteger margem",
     ]
     user_lower = user_message.lower()
     is_data_request = any(kw in user_lower for kw in DATA_KEYWORDS)
@@ -1300,6 +1336,13 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
                     function_response = str(ai_tools.simulate_price_change(**function_args))
                 elif function_name == "get_cmv_report":
                     function_response = str(ai_tools.get_cmv_report(**function_args))
+                elif function_name == "get_price_spike_alert":
+                    function_response = str(ai_tools.get_price_spike_alert(
+                        restaurant_name=function_args.get("restaurant_name"),
+                        threshold_pct=function_args.get("threshold_pct", 8)
+                    ))
+                elif function_name == "get_pricing_advisor":
+                    function_response = str(ai_tools.get_pricing_advisor(**function_args))
             except Exception as e:
                 function_response = f"Erro ao executar a ferramenta: {e}"
             

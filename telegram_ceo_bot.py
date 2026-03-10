@@ -259,6 +259,7 @@ def build_question_for_action(action_key: str, restaurant_name: str) -> str:
         "fichas":         prefix + "Audite todas as fichas técnicas e analise a lucratividade das receitas.",
         "markup_diario":  prefix + "Gere sugestões de precificação dinâmica baseada no clima e estoque.",
         "giro_insumo":    prefix + "Analise o giro de estoque e identifique capital empatado.",
+        "cao_guarda":     "Rode o Cão de Guarda agora e me mostre todos os ingredientes que subiram 8% ou mais nas últimas 2 semanas em qualquer casa.",
         # RH e Operação
         "escala":         prefix + "Calcule a necessidade de RH e escala de equipe para amanhã.",
         "garcons":        prefix + "Gere o relatório de produtividade e comissões dos garçons.",
@@ -362,7 +363,7 @@ def get_stock_keyboard():
     markup.add("🛒 Plano de Compras", "🔍 Auditoria de Rupturas")
     markup.add("📊 Análise de CMV", "📋 Fichas Técnicas")
     markup.add("💡 Markup Dinâmico", "📦 Giro de Estoque")
-    markup.add("🔙 Voltar Principal")
+    markup.add("🐕 Cão de Guarda", "🔙 Voltar Principal")
     return markup
 
 def get_hr_op_keyboard():
@@ -667,6 +668,15 @@ def handle_msg(message):
     elif text == "🔄 Sincronizar Tudo":
         cmd_sync(message)
         return
+    elif text == "🐕 Cão de Guarda":
+        bot.send_chat_action(message.chat.id, 'typing')
+        bot.reply_to(message, "🐕 *Cão de Guarda ativo!* Verificando preços das últimas 2 semanas...", parse_mode='Markdown')
+        try:
+            report = ai_tools.get_price_spike_alert(threshold_pct=8)
+            send_long_msg(message, report)
+        except Exception as e:
+            bot.reply_to(message, f"❌ Erro no Cão de Guarda: {e}")
+        return
 
     # ── Botões de submenu → perguntar a casa primeiro ─────────────────────────
     elif text in BUTTON_ACTION_MAP:
@@ -688,18 +698,31 @@ def handle_msg(message):
         except Exception as e:
             bot.reply_to(message, f"❌ Erro na IA: {str(e)}")
 
-def auto_sync_data():
-    """Silently sync all restaurant data from NetControll API."""
-    target_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+def warm_up_cache():
+    """Silently populate the cache engine with heavy reports for all restaurants."""
+    print(f"[{datetime.now()}] Iniciando Warm-Up do Cache (Pesados/30d)...")
+    from ai_tools import fetch_sales_data, fetch_expenses_data, fetch_expenses_supplier_data, fetch_cmv_data, fetch_inbound_data
+    
+    today = datetime.now()
+    d30 = (today - timedelta(days=30)).strftime('%Y-%m-%d')
+    d1 = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+    hoje_str = today.strftime('%Y-%m-%d')
+    d_mtd = today.replace(day=1).strftime('%Y-%m-%d')
+    
     for rest in RESTAURANTS:
         try:
-            session = get_session(rest['id'])
-            if session:
-                download_sales_json(session, target_date, rest['id'], rest['sales_file'])
-                download_stock_json(session, rest['id'], rest['stock_file'])
-                download_expenses_json(session, target_date, rest['id'], rest['expense_file'])
-        except:
-            pass
+            # 1. Immutable Cache (Mês passado até ontem - fica rápido para sempre)
+            fetch_sales_data(rest['id'], d30, d1)
+            fetch_expenses_data(rest['id'], d30, d1)
+            fetch_cmv_data(rest['id'], d30, d1)
+            fetch_expenses_supplier_data(rest['id'], d30, d1)
+            fetch_inbound_data(rest['id'], d30, d1)
+            
+            # 2. Ephemeral Cache (MTD - ajuda na lentidão de hoje)
+            fetch_sales_data(rest['id'], d_mtd, hoje_str)
+            fetch_expenses_data(rest['id'], d_mtd, hoje_str)
+        except Exception as e:
+            print(f"Erro no warm-up {rest['name']}: {e}")
 
 if __name__ == "__main__":
     print("XMenu Live Bot is running...")
@@ -835,16 +858,17 @@ if __name__ == "__main__":
                     except Exception as e:
                         print(f"[{now}] Erro no ranking semanal: {e}")
                 
-                # ── Auto-Sync data ──────────────────────────────────────────────
+                # ── Auto-Sync / Cache Warmer ──────────────────────────────────────────────
                 current_sync_key = f"{today}_{now.hour}"
-                if now.hour in [6, 13, 22] and now.minute >= 50 and state.get('last_sync') != current_sync_key:
+                # Roda a cada 4 horas
+                if now.hour % 4 == 0 and now.minute >= 10 and state.get('last_sync') != current_sync_key:
                     try:
-                        auto_sync_data()
+                        warm_up_cache()
                         state['last_sync'] = current_sync_key
                         save_state(state)
-                        print(f"[{now}] Auto-sync concluído.")
+                        print(f"[{now}] Cache Warmer concluído com sucesso.")
                     except Exception as e:
-                        print(f"[{now}] Erro no auto-sync: {e}")
+                        print(f"[{now}] Erro no Cache Warmer: {e}")
                 
                 # ── Briefing das 7h (via IA para síntese executiva) ────────────
                 if now.hour >= 7 and state.get('briefing') != today:
@@ -893,6 +917,22 @@ if __name__ == "__main__":
                             print(f"[{now}] Relatório de fechamento enviado.")
                     except Exception as e:
                         print(f"[{now}] Erro no fechamento: {e}")
+
+                # ── Cão de Guarda — Alertas de Preço Diários às 21h ──────────
+                if now.hour >= 21 and state.get('cao_guarda') != today:
+                    try:
+                        spike_report = ai_tools.get_price_spike_alert(threshold_pct=8)
+                        # Só envia se houver alertas reais (não apenas "Tudo dentro do normal")
+                        if spike_report and 'ALERTA' in spike_report and '0 ALERTA' not in spike_report:
+                            header = f"🐕 *CÃO DE GUARDA — {now.strftime('%d/%m/%Y')}*\n\n"
+                            send_to_ceo(header + spike_report[:3800])
+                            print(f"[{now}] Cão de Guarda: alertas de preço enviados.")
+                        else:
+                            print(f"[{now}] Cão de Guarda: sem alertas (preços estáveis).")
+                        state['cao_guarda'] = today
+                        save_state(state)
+                    except Exception as e:
+                        print(f"[{now}] Erro no Cão de Guarda: {e}")
 
                 # ── Auditoria Cruzada Diária às 22h ────────────────────────────
                 if now.hour >= 22 and state.get('audit_daily') != today:
