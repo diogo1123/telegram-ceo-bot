@@ -768,6 +768,20 @@ tools = [
                 "required": ["restaurant_name", "ingredient", "cost_increase_pct"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_watchdog_consolidated",
+            "description": "Cão de Guarda Consolidado: A ferramenta de monitoramento mais completa. Une alertas de variação de preço (inflação de insumos) com a auditoria de desvios, cancelamentos suspeitos e quebras de caixa das últimas 24h. Use quando o CEO pedir para 'ver o cão de guarda', 'ver alertas', 'o que aconteceu de errado' ou 'resumo de riscos'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant_name": {"type": "string", "description": "Opcional. Nome da casa (Nauan, Milagres, Ahau). Se vazio, verifica todas."}
+                },
+                "required": []
+            }
+        }
     }
 ]
 

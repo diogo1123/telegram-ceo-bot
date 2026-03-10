@@ -672,7 +672,7 @@ def handle_msg(message):
         bot.send_chat_action(message.chat.id, 'typing')
         bot.reply_to(message, "🐕 *Cão de Guarda ativo!* Verificando preços das últimas 2 semanas...", parse_mode='Markdown')
         try:
-            report = ai_tools.get_price_spike_alert(threshold_pct=8)
+            report = ai_tools.get_watchdog_consolidated()
             send_long_msg(message, report)
         except Exception as e:
             bot.reply_to(message, f"❌ Erro no Cão de Guarda: {e}")
@@ -921,14 +921,14 @@ if __name__ == "__main__":
                 # ── Cão de Guarda — Alertas de Preço Diários às 21h ──────────
                 if now.hour >= 21 and state.get('cao_guarda') != today:
                     try:
-                        spike_report = ai_tools.get_price_spike_alert(threshold_pct=8)
-                        # Só envia se houver alertas reais (não apenas "Tudo dentro do normal")
-                        if spike_report and 'ALERTA' in spike_report and '0 ALERTA' not in spike_report:
+                        report = ai_tools.get_watchdog_consolidated()
+                        # Só envia se houver alertas reais
+                        if "Tudo sob controle" not in report:
                             header = f"🐕 *CÃO DE GUARDA — {now.strftime('%d/%m/%Y')}*\n\n"
-                            send_to_ceo(header + spike_report[:3800])
-                            print(f"[{now}] Cão de Guarda: alertas de preço enviados.")
+                            send_to_ceo(header + report[:3800])
+                            print(f"[{now}] Cão de Guarda consolidado enviado.")
                         else:
-                            print(f"[{now}] Cão de Guarda: sem alertas (preços estáveis).")
+                            print(f"[{now}] Cão de Guarda: sem alertas críticos.")
                         state['cao_guarda'] = today
                         save_state(state)
                     except Exception as e:

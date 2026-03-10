@@ -5833,3 +5833,48 @@ def get_pricing_advisor(restaurant_name, ingredient, cost_increase_pct):
     return report[:8000]
 
 
+def get_watchdog_consolidated(restaurant_name=None):
+    """
+    Novo Cão de Guarda: Consolida Alertas de Preço + Auditoria Cruzada (Resumo).
+    Se restaurant_name for None, faz para todas as casas.
+    """
+    now = datetime.now()
+    today = now.strftime('%Y-%m-%d')
+    yesterday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+    targets = [find_restaurant_files(restaurant_name)] if restaurant_name else RESTAURANTS
+    
+    reports = []
+    
+    # 1. Alertas de Preço (🐕 Original)
+    price_alerts = get_price_spike_alert(restaurant_name, threshold_pct=8)
+    if "ALERTA" in price_alerts and "0 ALERTA" not in price_alerts:
+        reports.append(price_alerts)
+    
+    # 2. Resumo da Auditoria Cruzada (🚩 Fraudes/Desvios)
+    for rest in targets:
+        try:
+            audit_raw = get_complete_audit(rest['name'], start_date=yesterday, end_date=today)
+            # Extrair apenas o resumo e seções críticas
+            lines = audit_raw.splitlines()
+            highlights = []
+            resumo_exec = ""
+            
+            for line in lines:
+                if "RESUMO:" in line:
+                    resumo_exec = line
+                if "🔴" in line or "🔴" in line: # Captura linhas com alertas críticos
+                    highlights.append(line)
+            
+            if highlights:
+                header = f"🚩 **AUDITORIA CRÍTICA: {rest['name'].upper()}**\n"
+                header += f"{resumo_exec}\n"
+                body = "\n".join(highlights[:10])
+                reports.append(f"{header}{body}\n")
+        except: pass
+        
+    if not reports:
+        return "🐕 **CÃO DE GUARDA:** Tudo sob controle! Nenhum alerta de preço ou desvio crítico detectado nas últimas 24h. ✅"
+        
+    return "\n\n".join(reports)[:8000]
+
+# --- FIM DO ARQUIVO ---
