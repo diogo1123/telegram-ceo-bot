@@ -886,7 +886,7 @@ if __name__ == "__main__":
                             "(4) as 3 prioridades do dia com responsável e prazo. "
                             "Seja direto, use números precisos, sem texto genérico."
                         )
-                        briefing_ai = ai_manager.process_ceo_question(briefing_prompt)
+                        briefing_ai = ai_manager.process_ceo_question(briefing_prompt, skip_tool_guard=True)
                         if briefing_ai:
                             header = f"☀️ *BOM DIA, CEO* — {now.strftime('%d/%m/%Y')}\n\n"
                             send_to_ceo(header + briefing_ai)
@@ -958,7 +958,7 @@ if __name__ == "__main__":
                                 "(🔴 crítico, 🟡 atenção); (3) para cada item crítico, recomende uma ação imediata "
                                 "com responsável. Se não houver desvios relevantes, informe brevemente."
                             )
-                            audit_ai = ai_manager.process_ceo_question(audit_prompt)
+                            audit_ai = ai_manager.process_ceo_question(audit_prompt, skip_tool_guard=True)
                             send_to_ceo((audit_ai or full_audit)[:4000])
 
                         state['audit_daily'] = today
@@ -992,7 +992,7 @@ if __name__ == "__main__":
                                 "(3) total estimado em risco financeiro; "
                                 "(4) 3 ações prioritárias com responsável e prazo para a próxima semana."
                             )
-                            audit_ai = ai_manager.process_ceo_question(audit_prompt)
+                            audit_ai = ai_manager.process_ceo_question(audit_prompt, skip_tool_guard=True)
                             send_to_ceo((audit_ai or full_audit)[:4000])
 
                         state['audit_weekly'] = today

@@ -1181,8 +1181,8 @@ Comece listando os dados exatos recebidos das ferramentas:
 - Se a ferramenta retornou erro ou lista vazia: "Não encontrei dados no sistema para esta consulta no período informado. Verifique se há dados sincronizados (/sync)."
 - NUNCA use expressões como "aproximadamente", "cerca de", "estimado em" para dados que deveriam vir da ferramenta."""
 
-def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", chat_id=None):
-    print(f"[IA] Processando pergunta: {user_message}")
+def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", chat_id=None, skip_tool_guard=False):
+    print(f"[IA] Processando pergunta: {user_message[:120]}")
     messages = [
         {"role": "system", "content": _build_system_prompt(current_restaurant)},
     ]
@@ -1222,7 +1222,7 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
     user_lower = user_message.lower()
     is_data_request = any(kw in user_lower for kw in DATA_KEYWORDS)
 
-    if not tool_calls and is_data_request:
+    if not tool_calls and is_data_request and not skip_tool_guard:
         # Model skipped tool call for a data question — force it to use a tool
         print("[IA] Modelo não chamou ferramenta para pergunta de dados. Forçando...")
         messages.append(response_message)
