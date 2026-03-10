@@ -320,12 +320,41 @@ def get_session_for_rest(rest_id):
     except: pass
     return None
 
+def fetch_live_stock_data(rest_id):
+    """
+    Busca dados de estoque ao vivo tentando primeiro 'listagem-estoque' 
+    (mais detalhado, tem unidade/peso/custo) e depois 'inventario' (simplificado).
+    """
+    session = get_session_for_rest(rest_id)
+    if not session: return []
+    
+    # 1. Tenta listagem-estoque (STOCK_LISTING_URL = portal #/relatorio/listagem-estoque)
+    try:
+        r = session.get(STOCK_LISTING_URL, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                print(f"[fetch_live_stock_data] listagem-estoque OK ({len(data)} itens)")
+                return data
+    except: pass
+    
+    # 2. Fallback: inventário (INVENTORY_URL = portal #/estoque/inventario)
+    try:
+        r = session.get(INVENTORY_URL, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                print(f"[fetch_live_stock_data] INVENTORY_URL fallback OK ({len(data)} itens)")
+                return data
+    except: pass
+    
+    return []
+
 def fetch_sales_data(rest_id, start_date=None, end_date=None):
     if not start_date: start_date = datetime.now().strftime('%Y-%m-%d')
     if not end_date: end_date = start_date
     
     from cache_engine import get_cached
-    
     def _live_fetch(r_id, sd, ed):
         session = get_session_for_rest(r_id)
         if not session: return []
@@ -553,15 +582,12 @@ def save_inventory_snapshot(restaurant_name: str, date_str: str = None) -> str:
     session = get_session_for_rest(rest['id'])
     if not session:
         return f"Erro de autenticação para {rest['name']}."
-    try:
-        r = session.get(INVENTORY_URL)
-        if r.status_code != 200:
-            return f"API retornou status {r.status_code} para {rest['name']}."
-        data = r.json()
-        if not isinstance(data, list) or not data:
-            return f"Inventário vazio ou inválido para {rest['name']}."
-    except Exception as e:
-        return f"Erro ao buscar inventário: {e}"
+    # 1. Tenta dados ao vivo (priorizando listagem-estoque)
+    data = fetch_live_stock_data(rest['id'])
+    
+    if not data:
+        return f"Inventário indisponível para {rest['name']} (API offline)."
+        
     safe_name = rest['name'].replace(" ", "_").replace("/", "_")
     filename  = f"{safe_name}_{date_str}.json"
     valor_total = sum(
@@ -823,37 +849,12 @@ def search_sales(restaurant_name, query, start_date=None, end_date=None):
 
 def get_stock(restaurant_name, query):
     """Consulta inventário de estoque.
-    Tenta API ao vivo primeiro (INVENTORY_URL = portal #/estoque/inventario),
+    Tenta API ao vivo primeiro (priorizando listagem-estoque),
     depois cai no JSON local como fallback."""
     rest = find_restaurant_files(restaurant_name)
-    data = []
-
-    # 1. Tenta listagem-estoque (mais completa: tem unidade/peso)
-    try:
-        session = get_session_for_rest(rest['id'])
-        if session:
-            r = session.get(STOCK_LISTING_URL)
-            if r.status_code == 200:
-                raw = r.json()
-                if isinstance(raw, list) and len(raw) > 0:
-                    data = raw
-                    print(f"[get_stock] listagem-estoque OK — {len(data)} itens | campos: {list(data[0].keys())}")
-    except Exception as e:
-        print(f"[get_stock] listagem-estoque falhou: {e}")
-
-    # 2. Fallback: inventário antigo
-    if not data:
-        try:
-            session = session or get_session_for_rest(rest['id'])
-            if session:
-                r = session.get(INVENTORY_URL)
-                if r.status_code == 200:
-                    raw = r.json()
-                    if isinstance(raw, list) and len(raw) > 0:
-                        data = raw
-                        print(f"[get_stock] INVENTORY_URL fallback OK — {len(data)} itens | campos: {list(data[0].keys())}")
-        except Exception as e:
-            print(f"[get_stock] INVENTORY_URL falhou: {e}")
+    
+    # 1. Tenta dados ao vivo (listagem ou inventário)
+    data = fetch_live_stock_data(rest['id'])
 
     # 2. Fallback: JSON local (sincronizado pelo /sync)
     if not data:
@@ -2508,15 +2509,8 @@ def get_purchasing_plan(restaurant_name, query=None, days_history=7, coverage_da
                             ingredient_demand[ing_name] = ingredient_demand.get(ing_name, 0) + (qty_sold * ing_qty)
         except: pass
         
-    stock_data = []
-    try:
-        session = get_session_for_rest(rest['id'])
-        if session:
-            r = session.get(INVENTORY_URL)
-            if r.status_code == 200:
-                raw = r.json()
-                if isinstance(raw, list) and len(raw) > 0: stock_data = raw
-    except: pass
+    # 3. Fetch Stock
+    stock_data = fetch_live_stock_data(rest['id'])
 
     if not stock_data:
         stock_path = rest.get('stock_file')
@@ -4429,15 +4423,7 @@ def get_inventory_turnover(restaurant_name, query=None):
         except: pass
 
     # 3. Fetch Stock
-    stock_data = []
-    try:
-        session = get_session_for_rest(rest['id'])
-        if session:
-            r = session.get(INVENTORY_URL)
-            if r.status_code == 200:
-                raw = r.json()
-                if isinstance(raw, list) and len(raw) > 0: stock_data = raw
-    except: pass
+    stock_data = fetch_live_stock_data(rest['id'])
 
     if not stock_data:
         stock_path = rest.get('stock_file')
