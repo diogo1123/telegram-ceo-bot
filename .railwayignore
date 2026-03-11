@@ -35,7 +35,7 @@ diagnose_*.py
 create_*.py
 venda_large.py
 xray_top_sales.py
-cache_engine.py
+# cache_engine.py is required by ai_tools.py - do NOT ignore
 ceo_analysis.py
 
 # Untracked data directories
