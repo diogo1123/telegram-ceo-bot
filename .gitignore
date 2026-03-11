@@ -16,6 +16,17 @@ pip-delete-this-directory.txt
 *.json
 *.xlsx
 *.csv
-*.txt
-!requirements.txt
-!Procfile
+# txt files (but keep requirements.txt and Procfile)
+scheduler_history.txt
+api_keywords.txt
+api_results.txt
+api_urls.txt
+help.txt
+logs.txt
+logs2.txt
+output_inspection.txt
+output_log.txt
+telegram_bot_full.txt
+telegram_bot_check.txt
+telegram_bot_tail.txt
+railway_login_url.txt
