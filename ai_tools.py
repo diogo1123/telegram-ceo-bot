@@ -5871,22 +5871,21 @@ def get_fiscal_product_audit(restaurant_name):
     ou cadastro fiscal incompleto que pode gerar erros na NFC-e e multas fiscais.
     """
     rest = find_restaurant_files(restaurant_name)
+    print(f"[FISCAL_AUDIT] Iniciando para {rest['name']} (id={rest['id']})")
     session = get_session_for_rest(rest['id'])
     if not session:
+        print(f"[FISCAL_AUDIT] Falha de autenticação para {rest['name']}")
         return "Erro de autenticação no portal."
 
     try:
-        resp = session.get(PRODUCT_FISCAL_URL)
+        print(f"[FISCAL_AUDIT] Buscando produtos via PRODUCT_URL...")
+        resp = session.get(PRODUCT_URL)
         if resp.status_code != 200:
-            return f"Erro ao acessar listagem fiscal (HTTP {resp.status_code}). Verifique se o endpoint está disponível para {rest['name']}."
+            return f"Erro ao acessar cadastro de produtos (HTTP {resp.status_code})."
 
         products = resp.json()
-        if not isinstance(products, list) or not products:
-            # Try wrapped response
-            if isinstance(products, dict):
-                products = products.get('data') or products.get('items') or products.get('produtos') or []
-            if not products:
-                return f"Nenhum produto fiscal encontrado para {rest['name']}."
+        if not products:
+            return f"Nenhum produto encontrado para {rest['name']}."
 
         total = len(products)
         sem_ncm = []
@@ -5902,16 +5901,16 @@ def get_fiscal_product_audit(restaurant_name):
         lookup_count = 0
 
         for p in products:
-            nome = str(p.get('nome') or p.get('descricao') or p.get('produto') or '').strip().upper()
+            nome = str(p.get('nome', '')).strip().upper()
             if not nome:
                 continue
 
-            ncm  = str(p.get('ncm') or p.get('codigoNcm') or '').strip().replace('.', '').replace('-', '')
-            cest = str(p.get('cest') or p.get('codigoCest') or '').strip()
-            cst  = str(p.get('cst') or p.get('cstIcms') or p.get('csosn') or p.get('situacaoTributaria') or '').strip()
-            cfop = str(p.get('cfop') or p.get('codigoCfop') or '').strip()
-            aliq = safe_float(p.get('aliquotaIcms') or p.get('aliquota') or p.get('icms') or 0)
-            grupo = str(p.get('nomeSubgrupo') or p.get('subgrupo') or p.get('grupo') or '').strip()
+            ncm  = str(p.get('ncm') or '').strip().replace('.', '').replace('-', '')
+            cest = str(p.get('cest') or '').strip()
+            cst  = str(p.get('cst') or p.get('csosn') or p.get('situacaoTributaria') or '').strip()
+            cfop = str(p.get('cfop') or '').strip()
+            aliq = safe_float(p.get('aliquotaIcms') or p.get('aliquota') or 0)
+            grupo = str(p.get('nomeSubgrupo') or '').strip()
             ativo = p.get('ativo', True)
 
             if not ativo:
@@ -6028,6 +6027,8 @@ def get_fiscal_product_audit(restaurant_name):
         return "\n".join(report)
 
     except Exception as e:
+        import traceback
+        print(f"[FISCAL_AUDIT_ERROR] {str(e)}\n{traceback.format_exc()}")
         return f"Erro na auditoria fiscal de produtos: {str(e)}"
 
 
