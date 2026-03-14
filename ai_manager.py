@@ -44,6 +44,56 @@ def add_to_history(chat_id, role, content):
     memory[key] = memory[key][-(6):]
     save_memory(memory)
 
+# ── Definição de planos/tiers ─────────────────────────────────────────────────
+PLANOS = {
+    "basico": {
+        "label": "Básico",
+        "tools": {
+            "get_revenue", "get_top_selling_items", "search_sales",
+            "get_daily_briefing", "get_scenario", "get_revenue_tracker",
+            "get_weekly_ranking", "get_payment_report", "get_cancellation_report",
+            "get_customer_success_report", "get_reviews_consolidated",
+            "get_weather_forecast",
+        },
+    },
+    "pro": {
+        "label": "Pro",
+        "tools": {
+            # Tudo do básico +
+            "get_revenue", "get_top_selling_items", "search_sales",
+            "get_daily_briefing", "get_scenario", "get_revenue_tracker",
+            "get_weekly_ranking", "get_payment_report", "get_cancellation_report",
+            "get_customer_success_report", "get_reviews_consolidated",
+            "get_weather_forecast",
+            # Financeiro
+            "get_cmv_report", "get_dre_report", "get_balancete",
+            "get_expenses", "get_financial_snapshot", "get_cashflow_runway",
+            "get_break_even_analysis", "get_tax_combo_suggestions",
+            # Fiscal
+            "get_fiscal_product_audit", "audit_product_registration",
+            "update_product_ncm", "get_fiscal_report",
+            # Estoque / Compras
+            "get_stock", "get_inbound_purchases", "get_inventory_turnover",
+            "get_purchasing_plan", "get_supplier_report", "get_supplier_inflation",
+            "get_invoice_reconciliation",
+            # Produto
+            "get_product_specs", "simulate_price_change",
+        },
+    },
+    "premium": {
+        "label": "Premium",
+        "tools": None,  # None = sem restrição, acesso total
+    },
+}
+
+def _get_tools_for_plano(plano: str) -> list:
+    """Retorna a lista de tools filtrada pelo plano do cliente."""
+    cfg = PLANOS.get(plano, PLANOS["premium"])
+    allowed = cfg["tools"]
+    if allowed is None:
+        return tools  # premium: tudo
+    return [t for t in tools if t["function"]["name"] in allowed]
+
 tools = [
     {
         "type": "function",
@@ -713,7 +763,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_dynamic_pricing_suggestions",
-            "description": "Retorna sugestões de precificação dinâmica (aumentar/reduzir preços no ERP) cruzando Clima, Ocupação e Estoque parado.",
+            "description": "Retorna sugestões de precificação dinâmica (somente aumentos de preço permitidos) cruzando Clima, Ocupação e Estoque parado.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -796,6 +846,25 @@ tools = [
                 "required": ["restaurant_name"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_product_ncm",
+            "description": "Atualiza o NCM de um produto no cadastro fiscal do ERP NetControll. Opcionalmente também atualiza CEST, CST/CSOSN e CFOP. Use quando o CEO pedir 'corrija o NCM', 'atualize a classificação fiscal', 'mude o NCM do produto', 'cadastre o NCM', 'corrija o cadastro fiscal' de um produto específico.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant_name": {"type": "string", "description": "Nome do restaurante (Nauan, Milagres, Ahau)."},
+                    "product_name": {"type": "string", "description": "Nome (parcial) do produto a atualizar."},
+                    "novo_ncm": {"type": "string", "description": "Código NCM com exatamente 8 dígitos numéricos (ex: '22030000')."},
+                    "novo_cest": {"type": "string", "description": "(Opcional) Novo código CEST."},
+                    "novo_cst": {"type": "string", "description": "(Opcional) Novo CST ou CSOSN."},
+                    "novo_cfop": {"type": "string", "description": "(Opcional) Novo CFOP."}
+                },
+                "required": ["restaurant_name", "product_name", "novo_ncm"]
+            }
+        }
     }
 ]
 
@@ -844,11 +913,13 @@ Se um valor não veio da ferramenta, escreva "Não informado" — nunca omita a 
 
     if "get_cmv_report" in tool_set:
         instructions.append("""
-📦 CMV — RENTABILIDADE POR ITEM:
-- Liste TODOS os itens: CMV unitário R$, preço venda R$, markup real, % CMV
-- Top 5 destruidores de margem (CMV% alto + volume alto): para cada um, sugira ajuste de preço OU redução de porção OU substituição com impacto R$ estimado
-- Top 5 heróis de lucro (markup alto + volume alto)
-- Benchmark: CMV F&B ≤ 35%, bebidas ≤ 25%. Se acima, diga quanto e o impacto em R$ no resultado""")
+📦 CMV — ANÁLISE DO RELATÓRIO GERADO PELA FERRAMENTA:
+A ferramenta gerou o relatório de CMV com dados REAIS, incluindo a seção "LISTAGEM CMV POR PRODUTO" com preços e custos reais vindos diretamente do portal ERP (listagem-cmv-produto). Siga estas regras ABSOLUTAS:
+- Os valores de "Preço venda", "CMV unit", "Markup" e "CMV%" por produto estão na seção LISTAGEM — use-os EXATAMENTE como estão
+- NUNCA invente, estime ou recalcule preço de venda, custo, markup ou CMV% de nenhum produto
+- Se um produto não aparece na LISTAGEM, escreva "não cadastrado no ERP" — nunca estime seus valores
+- Benchmark: CMV F&B ≤ 35%, bebidas ≤ 25%. Aplique somente aos valores que vieram da ferramenta
+- Se a ferramenta retornou "sem custo registrado no período", informe isso claramente ao CEO""")
 
     if "get_scenario" in tool_set:
         instructions.append("""
@@ -929,7 +1000,7 @@ Se um valor não veio da ferramenta, escreva "Não informado" — nunca omita a 
 - Abacaxis: retire do cardápio ou reformule urgentemente
 - Se Cavalos virassem Estrelas, quanto o lucro mensal aumentaria?""")
 
-    if "get_waste_audit" in tool_set or "get_audit" in tool_set:
+    if "get_audit" in tool_set and "get_waste_audit" not in tool_set:
         instructions.append("""
 🔍 AUDITORIA DE DESPERDÍCIO/INSUMO:
 - Liste cada discrepância: item, sistema vs físico, diferença, valor da diferença
@@ -1044,6 +1115,32 @@ IMPORTANTE: Cite os valores EXATOS que vieram nos dados. Não estime nem calcule
 - Casa com pior performance: diagnóstico e plano de recuperação específico
 - KPI mais preocupante em cada casa: ação recomendada por unidade""")
 
+    if "get_dynamic_pricing_suggestions" in tool_set:
+        instructions.append("""
+🎯 PRECIFICAÇÃO DINÂMICA — INSTRUÇÕES:
+A ferramenta já gerou o relatório completo de precificação. Apresente-o ao CEO exatamente como recebido, mantendo todos os itens, emojis e sugestões. NÃO diga que não tem dados — o relatório está na resposta da ferramenta. Se a ferramenta retornou um texto com clima, estoque e sugestões, apresente tudo ao CEO.""")
+
+    if "get_purchasing_plan" in tool_set:
+        instructions.append("""
+🛒 PLANO DE COMPRAS — INSTRUÇÕES:
+A ferramenta já gerou o plano de compras completo. Apresente-o ao CEO exatamente como recebido, listando todos os itens com estoque, consumo e sugestão de compra. NÃO diga que não tem dados — o plano está na resposta da ferramenta.""")
+
+    if "get_waste_audit" in tool_set:
+        instructions.append("""
+🔍 AUDITORIA DE RUPTURAS/DESPERDÍCIO — INSTRUÇÕES CRÍTICAS:
+A ferramenta já calculou os desvios usando dados reais (EI + Entradas − EF = Consumo Real vs Consumo Teórico). Siga estas regras:
+- Apresente o relatório EXATAMENTE como a ferramenta retornou — use SOMENTE os números do relatório
+- NUNCA invente ou substitua valores — se um campo diz "⚠️ sem snapshot", mantenha esse texto
+- Para itens com DIFERENÇA calculada: cite exatamente o desvio em unidades, R$ e % como vieram da ferramenta
+- Para itens sem EI: apresente o Consumo Teórico vs EF exatamente como mostrado
+- Seção de Resumo Financeiro: cite SOMENTE os valores que vieram na ferramenta
+- Se a ferramenta informou dados ausentes (ex: fichas técnicas indisponíveis), explique ao CEO o que isso significa e como resolver""")
+
+    if "get_predictive_hr_scale" in tool_set:
+        instructions.append("""
+👥 ESCALA DE RH PREDITIVA — INSTRUÇÕES:
+A ferramenta já gerou a sugestão de escala. Apresente-o ao CEO exatamente como recebido. NÃO diga que não tem dados — o relatório está na resposta da ferramenta.""")
+
     # Universal closing — always present
     # Universal closing — always present
     instructions.append("""
@@ -1072,10 +1169,13 @@ Proibido usar "provavelmente".""")
 
 def _build_system_prompt(current_restaurant):
     today = datetime.now().strftime('%Y-%m-%d')
-    return f"""Você é o Consultor Estratégico CEO do Grupo Milagres (Nauan Beach Club, Milagres do Toque, Ahau Arte e Cozinha). Restaurante atual: {current_restaurant}. Hoje: {today}.
+    return f"""Você é o Consultor Estratégico CEO do Grupo Milagres (Nauan Beach Club, Milagres do Toque, Ahau Arte e Cozinha). Restaurante padrão desta sessão: {current_restaurant}. Hoje: {today}.
+
+⚠️ **REGRA CRÍTICA DE ISOLAMENTO DE DADOS**:
+Cada chamada de ferramenta DEVE usar o `restaurant_name` EXATAMENTE como mencionado na mensagem atual do usuário. Se a mensagem atual NÃO especificar um restaurante, use "{current_restaurant}". NUNCA use o restaurante de mensagens anteriores como padrão para a mensagem atual. Dados de casas diferentes são COMPLETAMENTE SEPARADOS — misturar dados de restaurantes é um erro grave.
 
 🧠 **MEMÓRIA CIRCUNSTANCIAL (CONTEXTO DA CONVERSA)**:
-Você tem acesso ao histórico de mensagens acima! Se o usuário fizer uma pergunta de continuação (ex: "e do mês passado?", "e do Ahau?", "quem foi o maior?"), VOCÊ DEVE HERDAR o contexto da conversa anterior (como as datas analisadas, o restaurante que estava sendo consultado, o insumo em foco) para preencher os parâmetros das suas ferramentas e não pedir para ele repetir.
+Você tem acesso ao histórico de mensagens acima! Se o usuário fizer uma pergunta de continuação (ex: "e do mês passado?", "quem foi o maior?"), VOCÊ DEVE HERDAR o contexto da conversa anterior (como as datas analisadas, o insumo em foco) para preencher os parâmetros. Mas para RESTAURANTE: herde só se a mensagem atual confirmar explicitamente (ex: "e lá?", "e nele?") — caso contrário use "{current_restaurant}".
 
 Suas fontes de dados principais no portal NetControll são:
 - Vendas por Produto: https://portal.netcontroll.com.br/#/relatorio/venda-produto
@@ -1109,6 +1209,9 @@ CMV % = Custo ÷ Receita × 100. Só calcule se AMBOS os valores vieram da ferra
 
 **REGRA 7 — VERIFICAÇÃO FINAL ANTES DE ENVIAR.**
 Antes de escrever cada número na resposta, pergunte mentalmente: "Este valor está literalmente no retorno da ferramenta?" Se não → remova ou marque como "não disponível".
+
+**REGRA 8 — PREÇO NUNCA DIMINUI VIA BOT.**
+⛔ REGRA ABSOLUTA DE PRECIFICAÇÃO: Você JAMAIS pode sugerir, calcular ou pedir a aplicação de uma redução de preço. O preço de qualquer produto não pode diminuir via bot — em nenhuma circunstância, nem em dias de chuva, nem por baixa demanda, nem por excesso de estoque. Estratégias para esses cenários devem ser combos, upsell, pacotes e eventos temáticos — nunca corte de preço unitário. Se o usuário pedir redução, recuse educadamente e ofereça uma alternativa sem reduzir preço.
 
 ════════════════════════════════════════
 🔧 FERRAMENTA CERTA PARA CADA PEDIDO
@@ -1161,6 +1264,7 @@ Antes de escrever cada número na resposta, pergunte mentalmente: "Este valor es
 - Escala de RH → get_predictive_hr_scale
 - Economia fiscal PIS/COFINS → get_tax_combo_suggestions
 - Auditoria fiscal de produtos (NCM, CEST, CST, CFOP, alíquota, cadastro fiscal) → get_fiscal_product_audit
+- Atualizar/corrigir NCM (e opcionalmente CEST, CST, CFOP) de um produto no ERP → update_product_ncm
 
 Se período não especificado → assuma hoje ({today}), reafirme na resposta.
 Se pedir as 3 casas → chame get_scenario para cada uma separadamente.
@@ -1210,10 +1314,13 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
     
     messages.append({"role": "user", "content": user_message})
 
+    plano = ai_tools.get_client_plano()
+    tools_ativos = _get_tools_for_plano(plano)
+
     response = client.chat.completions.create(
         model=OLLAMA_MODEL,
         messages=messages,
-        tools=tools,
+        tools=tools_ativos,
         tool_choice="auto",
         temperature=0.0
     )
@@ -1259,6 +1366,9 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
             function_name = tool_call.function.name
             tools_called.append(function_name)
             function_args = json.loads(tool_call.function.arguments)
+            # Log para detectar mistura de restaurantes
+            rest_escolhido = function_args.get("restaurant_name", "N/A")
+            print(f"[IA] tool={function_name} restaurant_name={rest_escolhido} args={list(function_args.keys())}")
             
             function_response = "Função não encontrada."
             try:
@@ -1374,6 +1484,8 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
                     function_response = str(ai_tools.get_pricing_advisor(**function_args))
                 elif function_name == "get_fiscal_product_audit":
                     function_response = str(ai_tools.get_fiscal_product_audit(**function_args))
+                elif function_name == "update_product_ncm":
+                    function_response = str(ai_tools.update_product_ncm(**function_args))
             except Exception as e:
                 function_response = f"Erro ao executar a ferramenta: {e}"
             
@@ -1395,21 +1507,27 @@ def process_ceo_question(user_message, current_restaurant="Nauan Beach Club", ch
             temperature=0.0
         )
         result = second_response.choices[0].message.content
-        
+        if not result:
+            print(f"[IA] AVISO: second_response retornou content vazio/None. finish_reason={second_response.choices[0].finish_reason}")
+            result = "⚠️ O modelo não gerou uma resposta. Tente novamente ou reformule a pergunta."
+
         # Save to memory
         if chat_id:
             add_to_history(chat_id, "user", user_message)
             add_to_history(chat_id, "assistant", result)
-        
+
         return result
-        
+
     result = response_message.content
-    
+    if not result:
+        print(f"[IA] AVISO: first_response sem tool_calls retornou content vazio/None.")
+        result = "⚠️ O modelo não gerou uma resposta. Tente novamente ou reformule a pergunta."
+
     # Save to memory
     if chat_id:
         add_to_history(chat_id, "user", user_message)
         add_to_history(chat_id, "assistant", result)
-    
+
     return result
 
 if __name__ == "__main__":

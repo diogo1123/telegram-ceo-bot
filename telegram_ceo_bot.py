@@ -4,6 +4,7 @@ import openpyxl
 import requests
 from datetime import datetime, timedelta
 import json
+import re
 import ai_manager
 import ai_tools
 
@@ -211,8 +212,6 @@ def clean_val(v):
     try: return float(s)
     except: return 0.0
 
-AUTH_FILE = "authorized_chats.json"
-
 # ── Mapa de ações pendentes por chat ──────────────────────────────────────────
 # Guarda qual botão foi clicado enquanto aguardamos a seleção do restaurante
 pending_actions: dict = {}   # { chat_id: "action_key" }
@@ -275,7 +274,400 @@ def build_question_for_action(action_key: str, restaurant_name: str) -> str:
     }
     return questions.get(action_key, prefix + action_key)
 
-ALLOWED_PHONES = ["5582991333541", "+5582991333541", "82991333541"]
+# ── Admin ─────────────────────────────────────────────────────────────────────
+ADMIN_CHAT_ID = 7907362924  # chat_id do Diogo (dono do sistema)
+
+# ── Rastreamento do restaurante ativo por conversa ────────────────────────────
+# Garante que cada usuário sempre consulte o restaurante correto, mesmo em
+# perguntas de continuação sem nome explícito ("e o estoque?", "e hoje?").
+_last_restaurant: dict = {}  # {chat_id: restaurant_name}
+
+_RESTAURANT_ALIASES = {
+    "nauan":        "Nauan Beach Club",
+    "milagres":     "Milagres do Toque",
+    "toque":        "Milagres do Toque",
+    "ahau":         "Ahau Arte e Cozinha",
+}
+
+def _get_allowed_restaurants(chat_id: int) -> list:
+    """Lista de dicts de restaurantes permitidos para este chat_id."""
+    if chat_id == ADMIN_CHAT_ID:
+        return RESTAURANTS
+    client = get_client(chat_id)
+    if client:
+        return client.get("restaurants", [])
+    return []
+
+def _detect_restaurant(text: str, allowed: list) -> str | None:
+    """Detecta se o texto menciona explicitamente um restaurante permitido.
+    Usa word boundary para evitar falsos positivos (ex: 'toque' em 'estoque').
+    """
+    import re
+    if not text:
+        return None
+    allowed_names = {r["name"] for r in allowed}
+    text_lower = text.lower()
+    for alias, name in _RESTAURANT_ALIASES.items():
+        if re.search(r'\b' + re.escape(alias) + r'\b', text_lower) and name in allowed_names:
+            return name
+    return None
+
+def _resolve_restaurant(chat_id: int, text: str = "") -> str:
+    """
+    Resolve qual restaurante usar para esta mensagem:
+    1. Se o texto menciona explicitamente um restaurante permitido → usa ele e memoriza.
+    2. Senão, usa o último restaurante mencionado nesta conversa.
+    3. Senão, usa o primeiro restaurante permitido do usuário.
+    Para clientes com 1 só restaurante, retorna sempre esse único restaurante.
+    """
+    allowed = _get_allowed_restaurants(chat_id)
+    if not allowed:
+        return "Nauan Beach Club"
+
+    detected = _detect_restaurant(text, allowed)
+    if detected:
+        _last_restaurant[chat_id] = detected
+        return detected
+
+    remembered = _last_restaurant.get(chat_id)
+    if remembered and any(r["name"] == remembered for r in allowed):
+        return remembered
+
+    # Padrão: primeiro restaurante cadastrado
+    default = allowed[0]["name"]
+    _last_restaurant[chat_id] = default
+    return default
+
+# ── Registro de clientes (multi-tenant) ──────────────────────────────────────
+import threading as _threading
+from cryptography.fernet import Fernet, InvalidToken as _InvalidToken
+
+CLIENTS_FILE = "clients.json"
+_clients_lock = _threading.Lock()
+
+def _get_fernet() -> Fernet | None:
+    """Retorna instância Fernet usando FERNET_KEY do ambiente, ou None se não configurada."""
+    key = os.getenv("FERNET_KEY", "")
+    if not key:
+        return None
+    try:
+        return Fernet(key.encode())
+    except Exception:
+        return None
+
+def _encrypt_pass(plain: str) -> str:
+    """Criptografa senha. Retorna texto cifrado ou o valor original se sem chave."""
+    f = _get_fernet()
+    if not f or not plain:
+        return plain
+    return f.encrypt(plain.encode()).decode()
+
+def _decrypt_pass(stored: str) -> str:
+    """Descriptografa senha. Retorna valor original se sem chave ou já em texto puro."""
+    f = _get_fernet()
+    if not f or not stored:
+        return stored
+    try:
+        return f.decrypt(stored.encode()).decode()
+    except _InvalidToken:
+        return stored  # já estava em texto puro (migração gradual)
+
+def load_clients() -> dict:
+    with _clients_lock:
+        if os.path.exists(CLIENTS_FILE):
+            try:
+                with open(CLIENTS_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except: return {}
+        return {}
+
+def save_clients(clients: dict):
+    with _clients_lock:
+        tmp = CLIENTS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(clients, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CLIENTS_FILE)  # atomic write — evita arquivo corrompido
+
+def get_client(chat_id) -> dict | None:
+    c = load_clients().get(str(chat_id))
+    if c:
+        # Descriptografa senha em memória, nunca modifica o arquivo
+        c = dict(c)
+        c["net_pass"] = _decrypt_pass(c.get("net_pass", ""))
+    return c
+
+def register_client(chat_id, net_user: str, net_pass: str, restaurants: list,
+                    telegram_name: str = "", plano: str = "basico"):
+    clients = load_clients()
+    clients[str(chat_id)] = {
+        "net_user": net_user,
+        "net_pass": _encrypt_pass(net_pass),
+        "restaurants": restaurants,
+        "plano": plano,
+        "plano_expira": None,  # preenchido pelo admin ao aprovar
+        "active": False,
+        "approved": False,
+        "telegram_name": telegram_name,
+        "registered_at": datetime.now().strftime("%Y-%m-%d"),
+    }
+    save_clients(clients)
+    # Notifica admin para aprovação
+    _notify_admin_new_client(chat_id, telegram_name, restaurants)
+
+def _notify_admin_new_client(chat_id, telegram_name: str, restaurants: list):
+    try:
+        rest_names = ", ".join(r["name"] for r in restaurants) or "N/A"
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.row(
+            telebot.types.InlineKeyboardButton("✅ Aprovar", callback_data=f"approve|{chat_id}"),
+            telebot.types.InlineKeyboardButton("❌ Recusar", callback_data=f"deny|{chat_id}"),
+        )
+        bot.send_message(
+            ADMIN_CHAT_ID,
+            f"🆕 *Novo cadastro aguardando aprovação:*\n\n"
+            f"👤 {telegram_name or 'Desconhecido'}  (chat\\_id: `{chat_id}`)\n"
+            f"🏠 Restaurante(s): {rest_names}\n"
+            f"📅 Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+            reply_markup=markup,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"[ADMIN_NOTIFY] Erro ao notificar admin: {e}")
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+def check_auth(message) -> bool:
+    # Limpa SEMPRE o contexto residual de qualquer requisição anterior nesta thread.
+    # Essencial em thread pools onde threads são reutilizadas entre clientes.
+    ai_tools.clear_client_context()
+
+    # Admin eterno — nunca bloqueado, nunca precisa de aprovação
+    if message.chat.id == ADMIN_CHAT_ID:
+        ai_tools.set_client_context("", "", [])  # usa credenciais globais do env
+        return True
+
+    client = get_client(message.chat.id)
+    if client:
+        if not client.get("approved"):
+            bot.send_message(
+                message.chat.id,
+                "⏳ Seu acesso está *pendente de aprovação* pelo administrador.\n"
+                "Você será notificado assim que for liberado.",
+                parse_mode="Markdown",
+            )
+            return False
+
+        # Verifica expiração do plano
+        expira = client.get("plano_expira")
+        if expira:
+            try:
+                if datetime.strptime(expira, "%Y-%m-%d") < datetime.now():
+                    # Suspende automaticamente e avisa o admin
+                    clients_all = load_clients()
+                    clients_all[str(message.chat.id)]["active"] = False
+                    save_clients(clients_all)
+                    bot.send_message(
+                        message.chat.id,
+                        "⏰ Seu plano *venceu*.\n"
+                        "Entre em contato com o suporte para renovar o acesso.",
+                        parse_mode="Markdown",
+                    )
+                    try:
+                        name = client.get("telegram_name", str(message.chat.id))
+                        plano_label = client.get("plano", "?").title()
+                        bot.send_message(
+                            ADMIN_CHAT_ID,
+                            f"⏰ *Plano vencido:* {name}\n"
+                            f"Plano: {plano_label} | Venceu em: {expira}\n"
+                            f"chat\\_id: `{message.chat.id}`",
+                            parse_mode="Markdown",
+                        )
+                    except: pass
+                    return False
+            except ValueError:
+                pass  # data malformada — ignora
+
+        if not client.get("active"):
+            bot.send_message(
+                message.chat.id,
+                "🚫 Seu acesso foi *suspenso*.\n"
+                "Entre em contato com o suporte para mais informações.",
+                parse_mode="Markdown",
+            )
+            return False
+
+        # Injeta credenciais + plano do cliente para esta thread
+        ai_tools.set_client_context(
+            client["net_user"],
+            client["net_pass"],
+            client["restaurants"],
+            plano=client.get("plano", "premium"),
+        )
+        return True
+    start_onboarding(message)
+    return False
+
+# ── Onboarding self-service ───────────────────────────────────────────────────
+_onboarding: dict = {}  # {chat_id: {"step": str, "data": {}}}
+
+PARTNER_LIST_URL = "https://aws.netcontroll.com.br/netadm/api/v1/parceiro"
+
+def _try_login(email: str, senha: str):
+    """Tenta autenticar no NetControll. Retorna (token, session) ou (None, None)."""
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json", "App-Origin": "Portal"})
+    try:
+        r = session.post(LOGIN_URL, json={"Email": email, "Senha": senha}, timeout=12)
+        if r.status_code == 200:
+            token = r.json().get("data", {}).get("access_token")
+            if token:
+                session.headers.update({"Authorization": f"Bearer {token}"})
+                return token, session
+    except: pass
+    return None, None
+
+def _fetch_restaurants(session) -> list:
+    """Tenta listar os parceiros/restaurantes disponíveis para a conta."""
+    try:
+        r = session.get(PARTNER_LIST_URL, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            # Normaliza lista de parceiros para {id, name}
+            items = data if isinstance(data, list) else data.get("data", [])
+            rests = []
+            for item in items:
+                rid  = item.get("id") or item.get("parceiro") or item.get("parceiroId")
+                name = (item.get("nome") or item.get("nomeFantasia") or
+                        item.get("name") or item.get("razaoSocial") or f"Restaurante {rid}")
+                if rid:
+                    rests.append({"id": int(rid), "name": str(name)})
+            return rests
+    except: pass
+    return []
+
+def start_onboarding(message):
+    cid = message.chat.id
+    _onboarding[cid] = {"step": "awaiting_email", "data": {}}
+    bot.send_message(
+        cid,
+        "👋 *Bem-vindo ao XMenu Bot!*\n\n"
+        "Para começar, preciso das suas credenciais do portal NetControll.\n\n"
+        "📧 Digite seu *e-mail* de acesso ao portal:",
+        parse_mode="Markdown",
+    )
+    bot.register_next_step_handler(message, _onboarding_email)
+
+def _onboarding_email(message):
+    cid = message.chat.id
+    email = message.text.strip() if message.text else ""
+    if not email or "@" not in email:
+        bot.send_message(cid, "❌ E-mail inválido. Digite novamente:")
+        bot.register_next_step_handler(message, _onboarding_email)
+        return
+    _onboarding.setdefault(cid, {"data": {}})["data"]["email"] = email
+    _onboarding[cid]["step"] = "awaiting_password"
+    bot.send_message(cid, "🔑 Agora digite sua *senha* do portal:", parse_mode="Markdown")
+    bot.register_next_step_handler(message, _onboarding_password)
+
+def _onboarding_password(message):
+    cid = message.chat.id
+    senha = message.text.strip() if message.text else ""
+    if not senha:
+        bot.send_message(cid, "❌ Senha não pode ser vazia. Digite novamente:")
+        bot.register_next_step_handler(message, _onboarding_password)
+        return
+
+    email = _onboarding[cid]["data"]["email"]
+    bot.send_message(cid, "⏳ Verificando credenciais no portal...")
+
+    token, session = _try_login(email, senha)
+    if not token:
+        bot.send_message(
+            cid,
+            "❌ *Credenciais inválidas.* Verifique e-mail e senha e tente novamente.\n\n"
+            "📧 Digite seu *e-mail*:",
+            parse_mode="Markdown",
+        )
+        _onboarding[cid] = {"step": "awaiting_email", "data": {}}
+        bot.register_next_step_handler(message, _onboarding_email)
+        return
+
+    _onboarding[cid]["data"]["senha"] = senha
+    _onboarding[cid]["step"] = "confirming_restaurants"
+
+    rests = _fetch_restaurants(session)
+    _onboarding[cid]["data"]["restaurants"] = rests
+
+    if rests:
+        markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+        for r in rests:
+            markup.add(r["name"])
+        markup.add("Todos")
+        bot.send_message(
+            cid,
+            f"✅ *Login confirmado!* Encontrei {len(rests)} restaurante(s) na sua conta:\n\n" +
+            "\n".join(f"• {r['name']}" for r in rests) +
+            "\n\nQual(is) deseja monitorar? (selecione ou escreva *Todos*)",
+            reply_markup=markup,
+            parse_mode="Markdown",
+        )
+        bot.register_next_step_handler(message, _onboarding_confirm_restaurant)
+    else:
+        # Fallback: pede manualmente
+        bot.send_message(
+            cid,
+            "✅ *Login confirmado!*\n\n"
+            "Não consegui listar os restaurantes automaticamente.\n"
+            "Digite o *nome do seu restaurante* como aparece no portal:",
+            parse_mode="Markdown",
+        )
+        bot.register_next_step_handler(message, _onboarding_manual_restaurant)
+
+def _get_telegram_name(message) -> str:
+    u = message.from_user
+    if u.username:
+        return f"@{u.username}"
+    return (u.first_name or "") + (" " + u.last_name if u.last_name else "")
+
+def _onboarding_confirm_restaurant(message):
+    cid = message.chat.id
+    escolha = message.text.strip() if message.text else ""
+    rests = _onboarding[cid]["data"].get("restaurants", [])
+    email = _onboarding[cid]["data"]["email"]
+    senha = _onboarding[cid]["data"]["senha"]
+
+    if escolha.lower() == "todos" or not escolha:
+        selected = rests
+    else:
+        selected = [r for r in rests if escolha.lower() in r["name"].lower()]
+        if not selected:
+            selected = rests  # fallback: usa todos
+
+    register_client(cid, email, senha, selected, telegram_name=_get_telegram_name(message))
+    _onboarding.pop(cid, None)
+    bot.send_message(
+        cid,
+        f"✅ *Cadastro recebido!*\n\n"
+        f"Restaurante(s): {', '.join(r['name'] for r in selected)}\n\n"
+        "⏳ Seu acesso está sendo analisado pelo administrador.\n"
+        "Você receberá uma mensagem assim que for aprovado.",
+        parse_mode="Markdown",
+    )
+
+def _onboarding_manual_restaurant(message):
+    cid = message.chat.id
+    nome = message.text.strip() if message.text else "Meu Restaurante"
+    email = _onboarding[cid]["data"]["email"]
+    senha = _onboarding[cid]["data"]["senha"]
+    register_client(cid, email, senha, [{"id": 0, "name": nome}], telegram_name=_get_telegram_name(message))
+    _onboarding.pop(cid, None)
+    bot.send_message(
+        cid,
+        f"✅ *Cadastro recebido!*\n\n"
+        f"Restaurante: *{nome}*\n\n"
+        "⏳ Seu acesso está sendo analisado pelo administrador.\n"
+        "Você receberá uma mensagem assim que for aprovado.",
+        parse_mode="Markdown",
+    )
 
 # Manager groups: map restaurant name keyword to a Telegram group chat ID
 # To configure, send /register_group in the desired Telegram group
@@ -292,56 +684,6 @@ def load_manager_groups():
 def save_manager_groups(groups):
     with open(MANAGER_GROUPS_FILE, "w") as f:
         json.dump(groups, f)
-
-def load_auth_chats():
-    if os.path.exists(AUTH_FILE):
-        try:
-            with open(AUTH_FILE, "r") as f:
-                return json.load(f)
-        except: return []
-    return []
-
-def save_auth_chats(chats):
-    with open(AUTH_FILE, "w") as f:
-        json.dump(chats, f)
-
-def check_auth(message):
-    chats = load_auth_chats()
-    if message.chat.id in chats: return True
-    
-    markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    btn = telebot.types.KeyboardButton("Autorizar meu número", request_contact=True)
-    markup.add(btn)
-    bot.send_message(
-        message.chat.id, 
-        "⛔ *Acesso Restrito ao CEO!*\n\nPara a segurança dos dados financeiros, por favor, clique no botão abaixo para compartilhar seu Contato do Telegram, validando seu número (Diogo Albuquerque).", 
-        reply_markup=markup, 
-        parse_mode="Markdown"
-    )
-    return False
-
-@bot.message_handler(content_types=['contact'])
-def handle_contact(message):
-    try:
-        phone = message.contact.phone_number.replace("+", "").replace("-", "").replace(" ", "")
-        allowed = [p.replace("+", "") for p in ALLOWED_PHONES]
-        
-        if phone in allowed:
-            chats = load_auth_chats()
-            if message.chat.id not in chats:
-                chats.append(message.chat.id)
-                save_auth_chats(chats)
-            
-            bot.send_message(
-                message.chat.id, 
-                "✅ *Acesso Liberado!* Identidade confirmada. Você já pode enviar seus comandos para a inteligência financeira.", 
-                reply_markup=get_main_keyboard(), 
-                parse_mode="Markdown"
-            )
-        else:
-            bot.send_message(message.chat.id, f"❌ Número `{phone}` não autorizado. Acesso negado.", parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Erro na verificação: {e}")
 
 def get_main_keyboard():
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -469,34 +811,16 @@ def cmd_sync(message):
 def cmd_resumo(message):
     if not check_auth(message): return
     bot.send_chat_action(message.chat.id, 'typing')
-    results = []
-    total_geral = 0.0
-    
-    for rest in RESTAURANTS:
-        if os.path.exists(rest['sales_file']):
-            try:
-                data = analyze_sales(rest['sales_file'])
-                if data:
-                    total_casa = data['total_sales']
-                    results.append(f"• *{rest['name']}:* R$ {total_casa:,.2f}")
-                    total_geral += total_casa
-                else:
-                    results.append(f"• *{rest['name']}:* Erro de formato.")
-            except:
-                results.append(f"• *{rest['name']}:* Erro ao ler JSON.")
-        else:
-            results.append(f"• *{rest['name']}:* Sem dados (use /sync)")
-            
-    target_date_str = (datetime.now() - timedelta(days=1)).strftime('%d/%m')
-    header = f"💰 *Resumo Consolidado ({target_date_str})*\n\n"
-
-    body = "\n".join(results)
-    footer = f"\n\n💵 *TOTAL GERAL: R$ {total_geral:,.2f}*"
-
-    
-    bot.reply_to(message, header + body + footer, parse_mode='Markdown')
+    try:
+        report = ai_tools.get_daily_briefing()
+        send_long_msg(message, report)
+    except Exception as e:
+        bot.reply_to(message, f"❌ Erro ao gerar resumo: {e}")
 
 def send_long_msg(message, text):
+    if not text:
+        bot.reply_to(message, "⚠️ Sem resposta gerada. Tente novamente.")
+        return
     try:
         if len(text) <= 4000:
             bot.reply_to(message, text, parse_mode='Markdown')
@@ -553,7 +877,12 @@ def handle_voice(message):
         
         # Passar para o Gestor de IA
         bot.send_chat_action(message.chat.id, 'typing')
-        resposta_ia = ai_manager.process_ceo_question(transcribed_text, chat_id=message.chat.id)
+        current = _resolve_restaurant(message.chat.id, transcribed_text)
+        resposta_ia = ai_manager.process_ceo_question(
+            transcribed_text,
+            current_restaurant=current,
+            chat_id=message.chat.id
+        )
         send_long_msg(message, resposta_ia)
         
     except Exception as e:
@@ -575,6 +904,26 @@ def force_proactive(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Erro: {e}")
 
+def _set_auth_context_for(chat_id: int) -> bool:
+    """
+    Injeta o _client_ctx correto para um chat_id (usado em callbacks que não passam
+    por check_auth). Retorna False se o usuário não tiver acesso.
+    """
+    ai_tools.clear_client_context()
+    if chat_id == ADMIN_CHAT_ID:
+        ai_tools.set_client_context("", "", [])
+        return True
+    client = get_client(chat_id)
+    if client and client.get("approved") and client.get("active"):
+        ai_tools.set_client_context(
+            client["net_user"],
+            client["net_pass"],
+            client["restaurants"],
+            plano=client.get("plano", "premium"),
+        )
+        return True
+    return False
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("rest|"))
 def handle_restaurant_choice(call):
     """Recebe a seleção de restaurante via InlineKeyboard e executa a ação pendente."""
@@ -591,24 +940,36 @@ def handle_restaurant_choice(call):
         bot.answer_callback_query(call.id, "Ação expirada. Use os botões novamente.")
         return
 
+    # Injeta contexto de segurança — callbacks não passam por check_auth
+    if not _set_auth_context_for(chat_id):
+        bot.answer_callback_query(call.id, "Acesso não autorizado.")
+        return
+
     bot.answer_callback_query(call.id)
 
+    # Restaurantes que este usuário pode consultar (nunca o global RESTAURANTS)
+    allowed = _get_allowed_restaurants(chat_id)
+
     if rest_code == "__ALL__":
-        # Executa para todas as casas em sequência
-        label = "Todas as Casas"
-        bot.send_message(chat_id, f"⏳ Analisando *{label}*...", parse_mode="Markdown")
-        for rest in RESTAURANTS:
+        # Executa APENAS para as casas às quais este usuário tem acesso
+        bot.send_message(chat_id, f"⏳ Analisando *Todas as Casas*...", parse_mode="Markdown")
+        for rest in allowed:
             question = build_question_for_action(action, rest["name"])
             bot.send_chat_action(chat_id, "typing")
             bot.send_message(chat_id, f"🏠 *{rest['name']}*", parse_mode="Markdown")
             try:
                 resposta = ai_manager.process_ceo_question(question, current_restaurant=rest["name"], chat_id=chat_id)
-                # send_long_msg needs a message object; simulate with chat_id
                 _send_long(chat_id, resposta)
             except Exception as e:
                 bot.send_message(chat_id, f"❌ Erro em {rest['name']}: {e}")
     else:
-        # Executa para a casa selecionada
+        # Valida que rest_code está na lista de restaurantes permitidos
+        allowed_names = {r["name"] for r in allowed}
+        if rest_code not in allowed_names:
+            print(f"[SECURITY] chat_id={chat_id} tentou acessar '{rest_code}' (não permitido). Permitidos: {allowed_names}")
+            bot.send_message(chat_id, "⚠️ Acesso negado a este restaurante.")
+            return
+
         question = build_question_for_action(action, rest_code)
         bot.send_message(chat_id, f"⏳ Analisando *{rest_code}*...", parse_mode="Markdown")
         bot.send_chat_action(chat_id, "typing")
@@ -621,6 +982,9 @@ def handle_restaurant_choice(call):
 
 def _send_long(chat_id: int, text: str):
     """Envia texto longo em chunks de 4000 chars para um chat_id."""
+    if not text:
+        bot.send_message(chat_id, "⚠️ Sem resposta gerada. Tente novamente.")
+        return
     try:
         while text:
             if len(text) <= 4000:
@@ -634,6 +998,594 @@ def _send_long(chat_id: int, text: str):
         try:
             bot.send_message(chat_id, text[:4000])
         except: pass
+
+
+# ── Callbacks de aprovação de novos clientes ──────────────────────────────────
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("approve|", "deny|")))
+def handle_admin_decision(call):
+    if call.from_user.id != ADMIN_CHAT_ID:
+        bot.answer_callback_query(call.id, "⛔ Sem permissão.")
+        return
+
+    action, target_cid = call.data.split("|", 1)
+    clients = load_clients()
+    client = clients.get(target_cid)
+    if not client:
+        bot.answer_callback_query(call.id, "Cliente não encontrado.")
+        return
+
+    name = client.get("telegram_name", target_cid)
+    if action == "approve":
+        # Pede ao admin qual plano atribuir antes de liberar
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.row(
+            telebot.types.InlineKeyboardButton("⭐ Básico",   callback_data=f"setplan|{target_cid}|basico"),
+            telebot.types.InlineKeyboardButton("🚀 Pro",      callback_data=f"setplan|{target_cid}|pro"),
+            telebot.types.InlineKeyboardButton("💎 Premium",  callback_data=f"setplan|{target_cid}|premium"),
+        )
+        bot.edit_message_text(
+            f"✅ Aprovar *{name}* — escolha o plano:",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=markup, parse_mode="Markdown",
+        )
+    else:
+        client["approved"] = False
+        client["active"] = False
+        save_clients(clients)
+        try:
+            bot.send_message(
+                int(target_cid),
+                "❌ Seu cadastro foi *recusado* pelo administrador.\n"
+                "Entre em contato pelo suporte para mais informações.",
+                parse_mode="Markdown",
+            )
+        except: pass
+        bot.edit_message_text(f"❌ Recusado: {name}", call.message.chat.id, call.message.message_id)
+
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("setplan|"))
+def handle_set_plan(call):
+    if call.from_user.id != ADMIN_CHAT_ID:
+        bot.answer_callback_query(call.id, "⛔ Sem permissão.")
+        return
+
+    _, target_cid, plano = call.data.split("|", 2)
+    clients = load_clients()
+    client = clients.get(target_cid)
+    if not client:
+        bot.answer_callback_query(call.id, "Cliente não encontrado.")
+        return
+
+    from datetime import timedelta
+    expira = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+    client["active"] = True
+    client["approved"] = True
+    client["plano"] = plano
+    client["plano_expira"] = expira
+    save_clients(clients)
+
+    plano_labels = {"basico": "⭐ Básico", "pro": "🚀 Pro", "premium": "💎 Premium"}
+    label = plano_labels.get(plano, plano.title())
+    name = client.get("telegram_name", target_cid)
+
+    # Tutorial personalizado por plano
+    TUTORIAIS = {
+        "basico": (
+            "🎉 *Acesso liberado! Bem-vindo ao XMenu Bot.*\n\n"
+            f"Seu plano: *{label}* — válido até {expira}\n\n"
+            "📋 *O que você pode fazer:*\n"
+            "• _'Quanto faturamos ontem?'_\n"
+            "• _'Quais foram os 5 itens mais vendidos esta semana?'_\n"
+            "• _'Compare o faturamento das casas em março'_\n"
+            "• _'Como estão as avaliações do Google?'_\n\n"
+            "💡 Pode digitar ou enviar áudio — eu entendo os dois!"
+        ),
+        "pro": (
+            "🎉 *Acesso liberado! Bem-vindo ao XMenu Bot.*\n\n"
+            f"Seu plano: *{label}* — válido até {expira}\n\n"
+            "📋 *O que você pode fazer:*\n"
+            "• _'Qual o CMV do mês?'_\n"
+            "• _'Gere o DRE de fevereiro'_\n"
+            "• _'Audite os NCMs dos produtos'_\n"
+            "• _'Quais fornecedores aumentaram preço?'_\n"
+            "• _'Qual o break-even mensal?'_\n"
+            "• _'Preciso comprar o quê esta semana?'_\n\n"
+            "💡 Pode digitar ou enviar áudio — eu entendo os dois!"
+        ),
+        "premium": (
+            "🎉 *Acesso liberado! Bem-vindo ao XMenu Bot.*\n\n"
+            f"Seu plano: *{label}* — válido até {expira}\n\n"
+            "📋 *Você tem acesso completo — exemplos:*\n"
+            "• _'Tem alguma fraude no caixa hoje?'_\n"
+            "• _'Faça a engenharia de cardápio'_\n"
+            "• _'Qual a previsão de RH para o fim de semana?'_\n"
+            "• _'Detecte desperdício no estoque'_\n"
+            "• _'Sugira reajuste de preços para proteger a margem'_\n"
+            "• _'Auditoria cruzada completa'_\n\n"
+            "💡 Pode digitar ou enviar áudio — eu entendo os dois!"
+        ),
+    }
+
+    try:
+        bot.send_message(
+            int(target_cid),
+            TUTORIAIS.get(plano, TUTORIAIS["basico"]),
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown",
+        )
+    except: pass
+
+    bot.edit_message_text(
+        f"✅ {name} aprovado — plano {label} até {expira}",
+        call.message.chat.id, call.message.message_id,
+    )
+    bot.answer_callback_query(call.id)
+
+
+# ── Comandos admin ─────────────────────────────────────────────────────────────
+@bot.message_handler(commands=['clientes'])
+def cmd_clientes(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    clients = load_clients()
+    if not clients:
+        bot.reply_to(message, "Nenhum cliente cadastrado.")
+        return
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    linhas = ["👥 *Clientes cadastrados:*\n"]
+    for i, (cid, c) in enumerate(clients.items(), 1):
+        name = c.get("telegram_name") or cid
+        rests = ", ".join(r["name"] for r in c.get("restaurants", [])) or "N/A"
+        if not c.get("approved"):
+            status = "⏳ Pendente"
+            btn = telebot.types.InlineKeyboardButton(f"✅ Aprovar {name}", callback_data=f"approve|{cid}")
+            markup.add(btn)
+        elif c.get("active"):
+            status = "✅ Ativo"
+            btn = telebot.types.InlineKeyboardButton(f"🚫 Bloquear {name}", callback_data=f"block|{cid}")
+            markup.add(btn)
+        else:
+            status = "🚫 Bloqueado"
+            btn = telebot.types.InlineKeyboardButton(f"✅ Liberar {name}", callback_data=f"unblock|{cid}")
+            markup.add(btn)
+        linhas.append(f"{i}. {name} — {status}\n   🏠 {rests}\n   🆔 `{cid}`")
+
+    bot.reply_to(message, "\n".join(linhas), reply_markup=markup, parse_mode="Markdown")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("block|", "unblock|")))
+def handle_admin_toggle(call):
+    if call.from_user.id != ADMIN_CHAT_ID:
+        bot.answer_callback_query(call.id, "⛔ Sem permissão.")
+        return
+
+    action, target_cid = call.data.split("|", 1)
+    clients = load_clients()
+    client = clients.get(target_cid)
+    if not client:
+        bot.answer_callback_query(call.id, "Cliente não encontrado.")
+        return
+
+    name = client.get("telegram_name", target_cid)
+    if action == "block":
+        client["active"] = False
+        save_clients(clients)
+        try:
+            bot.send_message(int(target_cid),
+                "🚫 Seu acesso foi *suspenso* pelo administrador.", parse_mode="Markdown")
+        except: pass
+        bot.answer_callback_query(call.id, f"🚫 {name} bloqueado.")
+    else:
+        client["active"] = True
+        client["approved"] = True
+        save_clients(clients)
+        try:
+            bot.send_message(int(target_cid),
+                "✅ Seu acesso foi *restaurado!* Pode usar o bot normalmente.",
+                reply_markup=get_main_keyboard(), parse_mode="Markdown")
+        except: pass
+        bot.answer_callback_query(call.id, f"✅ {name} liberado.")
+
+    # Atualiza a lista de clientes
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except: pass
+    cmd_clientes(call.message)
+
+
+@bot.message_handler(commands=['bloquear'])
+def cmd_bloquear(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ Use: `/bloquear <chat_id>`", parse_mode="Markdown")
+        return
+    target_cid = parts[1].strip()
+    clients = load_clients()
+    if target_cid not in clients:
+        bot.reply_to(message, f"❌ Cliente `{target_cid}` não encontrado.", parse_mode="Markdown")
+        return
+    clients[target_cid]["active"] = False
+    save_clients(clients)
+    name = clients[target_cid].get("telegram_name", target_cid)
+    try:
+        bot.send_message(int(target_cid),
+            "🚫 Seu acesso foi *suspenso* pelo administrador.", parse_mode="Markdown")
+    except: pass
+    bot.reply_to(message, f"🚫 Acesso de *{name}* suspenso.", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=['liberar'])
+def cmd_liberar(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ Use: `/liberar <chat_id>`", parse_mode="Markdown")
+        return
+    target_cid = parts[1].strip()
+    clients = load_clients()
+    if target_cid not in clients:
+        bot.reply_to(message, f"❌ Cliente `{target_cid}` não encontrado.", parse_mode="Markdown")
+        return
+    clients[target_cid]["active"] = True
+    clients[target_cid]["approved"] = True
+    save_clients(clients)
+    name = clients[target_cid].get("telegram_name", target_cid)
+    try:
+        bot.send_message(int(target_cid),
+            "✅ Seu acesso foi *restaurado!* Pode usar o bot normalmente.",
+            reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    except: pass
+    bot.reply_to(message, f"✅ Acesso de *{name}* restaurado.", parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAINEL DE CONTROLE ADMIN UNIFICADO
+# ─────────────────────────────────────────────────────────────────────────────
+
+PLANO_LABELS = {"basico": "⭐ Básico", "pro": "🚀 Pro", "premium": "💎 Premium"}
+
+def _admin_client_status(c: dict) -> str:
+    if not c.get("approved"):
+        return "⏳ Pendente"
+    if not c.get("active"):
+        return "🚫 Bloqueado"
+    return "✅ Ativo"
+
+def _dias_restantes(expira_str) -> str:
+    if not expira_str:
+        return "sem data"
+    try:
+        dias = (datetime.strptime(expira_str, "%Y-%m-%d") - datetime.now()).days
+        if dias < 0:
+            return "VENCIDO"
+        return f"{dias}d"
+    except ValueError:
+        return "?"
+
+def _send_admin_dashboard(chat_id, message_id=None):
+    clients = load_clients()
+    ativos = sum(1 for c in clients.values() if c.get("active") and c.get("approved"))
+    pendentes = sum(1 for c in clients.values() if not c.get("approved"))
+    hoje = datetime.now()
+    vencendo = sum(
+        1 for c in clients.values()
+        if c.get("active") and c.get("approved") and c.get("plano_expira")
+        and 0 <= (datetime.strptime(c["plano_expira"], "%Y-%m-%d") - hoje).days <= 7
+    )
+
+    linhas = ["🎛️ *PAINEL DE CONTROLE*\n"]
+    linhas.append(f"👥 {ativos} cliente(s) ativo(s)")
+    if pendentes:
+        linhas.append(f"⏳ {pendentes} pendente(s) de aprovação")
+    if vencendo:
+        linhas.append(f"⚠️ {vencendo} vencendo em 7 dias")
+    texto = "\n".join(linhas)
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    row1 = [telebot.types.InlineKeyboardButton("👥 Ver Clientes", callback_data="adm_list")]
+    if pendentes:
+        row1.append(telebot.types.InlineKeyboardButton(f"⏳ Pendentes ({pendentes})", callback_data="adm_pending"))
+    markup.row(*row1)
+
+    if message_id:
+        try:
+            bot.edit_message_text(texto, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+        except: pass
+    else:
+        bot.send_message(chat_id, texto, reply_markup=markup, parse_mode="Markdown")
+
+
+def _send_admin_list(chat_id, message_id):
+    clients = load_clients()
+    if not clients:
+        bot.edit_message_text("Nenhum cliente cadastrado.", chat_id, message_id)
+        return
+
+    linhas = ["👥 *CLIENTES CADASTRADOS*\n"]
+    markup = telebot.types.InlineKeyboardMarkup()
+    for cid, c in clients.items():
+        name = c.get("telegram_name") or cid
+        status = _admin_client_status(c)
+        plano = PLANO_LABELS.get(c.get("plano", ""), "")
+        expira = c.get("plano_expira", "")
+        dias = _dias_restantes(expira) if c.get("approved") and c.get("active") else ""
+        plano_info = f" — {plano} {dias}".rstrip() if plano else ""
+        linhas.append(f"• {name} {status}{plano_info}")
+        markup.add(telebot.types.InlineKeyboardButton(f"👤 {name}", callback_data=f"adm_client|{cid}"))
+
+    markup.add(telebot.types.InlineKeyboardButton("⬅ Menu", callback_data="adm_menu"))
+    bot.edit_message_text("\n".join(linhas), chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+
+
+def _send_admin_client(chat_id, message_id, target_cid):
+    clients = load_clients()
+    c = clients.get(target_cid)
+    if not c:
+        bot.answer_callback_query(message_id, "Cliente não encontrado.")
+        return
+
+    name = c.get("telegram_name") or target_cid
+    rests = ", ".join(r["name"] for r in c.get("restaurants", [])) or "N/A"
+    plano = PLANO_LABELS.get(c.get("plano", ""), "N/A")
+    expira = c.get("plano_expira") or "—"
+    dias = _dias_restantes(c.get("plano_expira"))
+    cadastro = c.get("registered_at", "—")
+    status = _admin_client_status(c)
+
+    texto = (
+        f"👤 *{name}*\n"
+        f"🆔 `{target_cid}`\n"
+        f"🏠 {rests}\n"
+        f"🎯 Plano: {plano}\n"
+        f"📅 Vence: {expira} ({dias})\n"
+        f"📆 Cadastro: {cadastro}\n"
+        f"Status: {status}"
+    )
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    if c.get("approved") and c.get("active"):
+        markup.row(
+            telebot.types.InlineKeyboardButton("🔄 Mudar Plano", callback_data=f"adm_plan|{target_cid}"),
+            telebot.types.InlineKeyboardButton("+30 dias", callback_data=f"adm_renew|{target_cid}"),
+        )
+        markup.row(
+            telebot.types.InlineKeyboardButton("🚫 Bloquear", callback_data=f"adm_block|{target_cid}"),
+            telebot.types.InlineKeyboardButton("⬅ Lista", callback_data="adm_list"),
+        )
+    elif not c.get("approved"):
+        markup.row(
+            telebot.types.InlineKeyboardButton("✅ Aprovar", callback_data=f"adm_approve|{target_cid}"),
+            telebot.types.InlineKeyboardButton("❌ Recusar", callback_data=f"adm_deny|{target_cid}"),
+        )
+        markup.add(telebot.types.InlineKeyboardButton("⬅ Lista", callback_data="adm_list"))
+    else:  # bloqueado
+        markup.row(
+            telebot.types.InlineKeyboardButton("✅ Liberar", callback_data=f"adm_unblock|{target_cid}"),
+            telebot.types.InlineKeyboardButton("⬅ Lista", callback_data="adm_list"),
+        )
+
+    bot.edit_message_text(texto, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+
+
+def _send_admin_pending(chat_id, message_id):
+    clients = load_clients()
+    pendentes = {cid: c for cid, c in clients.items() if not c.get("approved")}
+    if not pendentes:
+        bot.edit_message_text("Nenhum cliente pendente.", chat_id, message_id,
+                              reply_markup=telebot.types.InlineKeyboardMarkup().add(
+                                  telebot.types.InlineKeyboardButton("⬅ Menu", callback_data="adm_menu")))
+        return
+
+    linhas = ["⏳ *AGUARDANDO APROVAÇÃO*\n"]
+    markup = telebot.types.InlineKeyboardMarkup()
+    for cid, c in pendentes.items():
+        name = c.get("telegram_name") or cid
+        rests = ", ".join(r["name"] for r in c.get("restaurants", [])) or "N/A"
+        cadastro = c.get("registered_at", "—")
+        linhas.append(f"👤 {name} — {rests}\n   📆 {cadastro}")
+        markup.row(
+            telebot.types.InlineKeyboardButton(f"✅ Aprovar {name}", callback_data=f"adm_approve|{cid}"),
+            telebot.types.InlineKeyboardButton(f"❌ Recusar {name}", callback_data=f"adm_deny|{cid}"),
+        )
+    markup.add(telebot.types.InlineKeyboardButton("⬅ Menu", callback_data="adm_menu"))
+    bot.edit_message_text("\n".join(linhas), chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+
+
+def _send_admin_plan_picker(chat_id, message_id, target_cid):
+    clients = load_clients()
+    c = clients.get(target_cid)
+    name = c.get("telegram_name", target_cid) if c else target_cid
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(
+        telebot.types.InlineKeyboardButton("⭐ Básico",  callback_data=f"adm_setplan|{target_cid}|basico"),
+        telebot.types.InlineKeyboardButton("🚀 Pro",     callback_data=f"adm_setplan|{target_cid}|pro"),
+        telebot.types.InlineKeyboardButton("💎 Premium", callback_data=f"adm_setplan|{target_cid}|premium"),
+    )
+    markup.add(telebot.types.InlineKeyboardButton("⬅ Cancelar", callback_data=f"adm_client|{target_cid}"))
+    bot.edit_message_text(
+        f"🔄 Escolha o novo plano para *{name}*:",
+        chat_id, message_id, reply_markup=markup, parse_mode="Markdown"
+    )
+
+
+@bot.message_handler(commands=['admin'])
+def cmd_admin(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    _send_admin_dashboard(message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_"))
+def handle_admin_panel(call):
+    if call.from_user.id != ADMIN_CHAT_ID:
+        bot.answer_callback_query(call.id, "⛔ Sem permissão.")
+        return
+
+    data = call.data
+    mid = call.message.message_id
+    cid_admin = call.message.chat.id
+
+    if data == "adm_menu":
+        _send_admin_dashboard(cid_admin, mid)
+
+    elif data == "adm_list":
+        _send_admin_list(cid_admin, mid)
+
+    elif data == "adm_pending":
+        _send_admin_pending(cid_admin, mid)
+
+    elif data.startswith("adm_client|"):
+        target_cid = data.split("|", 1)[1]
+        _send_admin_client(cid_admin, mid, target_cid)
+
+    elif data.startswith("adm_plan|"):
+        target_cid = data.split("|", 1)[1]
+        _send_admin_plan_picker(cid_admin, mid, target_cid)
+
+    elif data.startswith("adm_setplan|"):
+        _, target_cid, plano = data.split("|", 2)
+        clients = load_clients()
+        c = clients.get(target_cid)
+        if not c:
+            bot.answer_callback_query(call.id, "Cliente não encontrado.")
+            return
+        from datetime import timedelta
+        expira = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        c["plano"] = plano
+        c["plano_expira"] = expira
+        c["active"] = True
+        c["approved"] = True
+        save_clients(clients)
+        label = PLANO_LABELS.get(plano, plano)
+        name = c.get("telegram_name", target_cid)
+        # Envia tutorial se estiver sendo aprovado pela primeira vez via painel
+        TUTORIAIS = {
+            "basico": (
+                "🎉 *Acesso liberado! Bem-vindo ao XMenu Bot.*\n\n"
+                f"Seu plano: *{label}* — válido até {expira}\n\n"
+                "📋 *O que você pode fazer:*\n"
+                "• _'Quanto faturamos ontem?'_\n"
+                "• _'Quais foram os 5 itens mais vendidos esta semana?'_\n"
+                "• _'Como estão as avaliações do Google?'_\n\n"
+                "💡 Pode digitar ou enviar áudio — eu entendo os dois!"
+            ),
+            "pro": (
+                "🎉 *Acesso liberado! Bem-vindo ao XMenu Bot.*\n\n"
+                f"Seu plano: *{label}* — válido até {expira}\n\n"
+                "📋 *O que você pode fazer:*\n"
+                "• _'Qual o CMV do mês?'_\n"
+                "• _'Gere o DRE de fevereiro'_\n"
+                "• _'Quais fornecedores aumentaram preço?'_\n"
+                "• _'Qual o break-even mensal?'_\n\n"
+                "💡 Pode digitar ou enviar áudio — eu entendo os dois!"
+            ),
+            "premium": (
+                "🎉 *Acesso liberado! Bem-vindo ao XMenu Bot.*\n\n"
+                f"Seu plano: *{label}* — válido até {expira}\n\n"
+                "📋 *Acesso completo — exemplos:*\n"
+                "• _'Tem alguma fraude no caixa hoje?'_\n"
+                "• _'Sugira reajuste de preços para proteger a margem'_\n"
+                "• _'Auditoria cruzada completa'_\n\n"
+                "💡 Pode digitar ou enviar áudio — eu entendo os dois!"
+            ),
+        }
+        try:
+            bot.send_message(int(target_cid), TUTORIAIS.get(plano, TUTORIAIS["basico"]),
+                             reply_markup=get_main_keyboard(), parse_mode="Markdown")
+        except: pass
+        bot.answer_callback_query(call.id, f"✅ Plano {label} aplicado a {name}")
+        _send_admin_client(cid_admin, mid, target_cid)
+
+    elif data.startswith("adm_renew|"):
+        target_cid = data.split("|", 1)[1]
+        clients = load_clients()
+        c = clients.get(target_cid)
+        if not c:
+            bot.answer_callback_query(call.id, "Cliente não encontrado.")
+            return
+        from datetime import timedelta
+        atual = c.get("plano_expira")
+        base = datetime.now()
+        if atual:
+            try:
+                base = max(base, datetime.strptime(atual, "%Y-%m-%d"))
+            except ValueError:
+                pass
+        nova_expira = (base + timedelta(days=30)).strftime("%Y-%m-%d")
+        c["plano_expira"] = nova_expira
+        save_clients(clients)
+        name = c.get("telegram_name", target_cid)
+        bot.answer_callback_query(call.id, f"✅ {name} renovado até {nova_expira}")
+        _send_admin_client(cid_admin, mid, target_cid)
+
+    elif data.startswith("adm_block|"):
+        target_cid = data.split("|", 1)[1]
+        clients = load_clients()
+        c = clients.get(target_cid)
+        if not c:
+            bot.answer_callback_query(call.id, "Cliente não encontrado.")
+            return
+        c["active"] = False
+        save_clients(clients)
+        try:
+            bot.send_message(int(target_cid),
+                "🚫 Seu acesso foi *suspenso* pelo administrador.", parse_mode="Markdown")
+        except: pass
+        name = c.get("telegram_name", target_cid)
+        bot.answer_callback_query(call.id, f"🚫 {name} bloqueado.")
+        _send_admin_client(cid_admin, mid, target_cid)
+
+    elif data.startswith("adm_unblock|"):
+        target_cid = data.split("|", 1)[1]
+        clients = load_clients()
+        c = clients.get(target_cid)
+        if not c:
+            bot.answer_callback_query(call.id, "Cliente não encontrado.")
+            return
+        c["active"] = True
+        c["approved"] = True
+        save_clients(clients)
+        try:
+            bot.send_message(int(target_cid),
+                "✅ Seu acesso foi *restaurado!* Pode usar o bot normalmente.",
+                reply_markup=get_main_keyboard(), parse_mode="Markdown")
+        except: pass
+        name = c.get("telegram_name", target_cid)
+        bot.answer_callback_query(call.id, f"✅ {name} liberado.")
+        _send_admin_client(cid_admin, mid, target_cid)
+
+    elif data.startswith("adm_approve|"):
+        target_cid = data.split("|", 1)[1]
+        # Mostra seletor de plano (aprovação via painel)
+        _send_admin_plan_picker(cid_admin, mid, target_cid)
+
+    elif data.startswith("adm_deny|"):
+        target_cid = data.split("|", 1)[1]
+        clients = load_clients()
+        c = clients.get(target_cid)
+        if not c:
+            bot.answer_callback_query(call.id, "Cliente não encontrado.")
+            return
+        c["approved"] = False
+        c["active"] = False
+        save_clients(clients)
+        name = c.get("telegram_name", target_cid)
+        try:
+            bot.send_message(int(target_cid),
+                "❌ Seu cadastro foi *recusado* pelo administrador.\n"
+                "Entre em contato pelo suporte para mais informações.",
+                parse_mode="Markdown")
+        except: pass
+        bot.answer_callback_query(call.id, f"❌ {name} recusado.")
+        _send_admin_pending(cid_admin, mid)
+
+    bot.answer_callback_query(call.id)
 
 
 @bot.message_handler(func=lambda message: True)
@@ -693,7 +1645,12 @@ def handle_msg(message):
         # Texto livre ou áudio transcrito → manda direto para IA
         bot.send_chat_action(message.chat.id, 'typing')
         try:
-            resposta_ia = ai_manager.process_ceo_question(message.text, chat_id=message.chat.id)
+            current = _resolve_restaurant(message.chat.id, message.text or "")
+            resposta_ia = ai_manager.process_ceo_question(
+                message.text,
+                current_restaurant=current,
+                chat_id=message.chat.id
+            )
             send_long_msg(message, resposta_ia)
         except Exception as e:
             bot.reply_to(message, f"❌ Erro na IA: {str(e)}")
@@ -724,34 +1681,78 @@ def warm_up_cache():
         except Exception as e:
             print(f"Erro no warm-up {rest['name']}: {e}")
 
+def _send_to_chat(chat_id: int, text: str):
+    """Envia texto (em chunks se necessário) para um chat_id específico."""
+    if not text: return
+    try:
+        t = text
+        while t:
+            if len(t) <= 4000:
+                bot.send_message(chat_id, t, parse_mode='Markdown')
+                break
+            idx = t.rfind('\n', 0, 4000)
+            if idx == -1: idx = 4000
+            bot.send_message(chat_id, t[:idx], parse_mode='Markdown')
+            t = t[idx:].strip()
+    except Exception as e:
+        print(f"[scheduler] Erro ao enviar para chat_id={chat_id}: {e}")
+
+
+def send_to_ceo(text):
+    """
+    Envia mensagem APENAS ao admin (ADMIN_CHAT_ID).
+    Relatórios consolidados (briefing, ranking, auditoria) são CEO-only.
+    Clientes recebem apenas dados dos seus próprios restaurantes — ver _send_alerts_per_client.
+    """
+    _send_to_chat(ADMIN_CHAT_ID, text)
+
+
+def _extract_restaurant_sections(text: str, allowed_names: list) -> str:
+    """
+    Extrai de um relatório multi-restaurante apenas as seções permitidas.
+    Seções são delimitadas por linhas '🏠 Nome do Restaurante'.
+    Inclui sempre o cabeçalho do relatório (antes do primeiro 🏠).
+    """
+    if not text: return ""
+    # Divide consumindo o \n imediatamente antes de cada '🏠 ' — evita splits duplos
+    parts = re.split(r'\n(?=🏠 )', text)
+    header = parts[0]  # tudo antes do primeiro 🏠 (totais, título)
+    filtered = []
+    for part in parts[1:]:
+        first_line = part.split('\n', 1)[0].replace('🏠 ', '').strip()
+        if any(name.lower() in first_line.lower() for name in allowed_names):
+            filtered.append(part.strip())
+    if not filtered:
+        return ""
+    return (header.strip() + '\n\n' + '\n\n'.join(filtered)).strip()
+
+
+def _send_alerts_per_client(ceo_text: str):
+    """
+    Envia para cada cliente ativo (não-admin) APENAS as seções dos alertas
+    referentes aos restaurantes que ele tem permissão de ver.
+    """
+    if not ceo_text: return
+    clients_data = load_clients()
+    for cid, client in clients_data.items():
+        if not client.get("active") or not client.get("approved"):
+            continue
+        chat_id = int(cid)
+        if chat_id == ADMIN_CHAT_ID:
+            continue  # admin já recebe via send_to_ceo
+        allowed = client.get("restaurants", [])
+        if not allowed:
+            continue
+        allowed_names = [r["name"] for r in allowed]
+        filtered = _extract_restaurant_sections(ceo_text, allowed_names)
+        if filtered:
+            _send_to_chat(chat_id, filtered)
+
+
 if __name__ == "__main__":
     print("XMenu Live Bot is running...")
     import time
     import threading
-    
-    def send_to_ceo(text):
-        """Send a proactive message to all authorized chat IDs."""
-        try:
-            chats = load_auth_chats()
-            for chat_id in chats:
-                try:
-                    if len(text) <= 4000:
-                        bot.send_message(chat_id, text, parse_mode='Markdown')
-                    else:
-                        chunks = []
-                        t = text
-                        while len(t) > 0:
-                            if len(t) <= 4000:
-                                chunks.append(t)
-                                break
-                            idx = t.rfind('\n', 0, 4000)
-                            if idx == -1: idx = 4000
-                            chunks.append(t[:idx])
-                            t = t[idx:].strip()
-                        for c in chunks:
-                            bot.send_message(chat_id, c, parse_mode='Markdown')
-                except: pass
-        except: pass
 
     def scheduler_loop():
         """Background scheduler: Briefing at 7AM, Proactive Alerts every 4h, Weekly Ranking on Sundays."""
@@ -1033,9 +2034,14 @@ if __name__ == "__main__":
                         try:
                             result = ai_tools.get_proactive_alerts()
                             if isinstance(result, dict):
-                                if result.get('ceo'):
-                                    send_to_ceo(result['ceo'])
-                                
+                                ceo_text = result.get('ceo', '')
+                                if ceo_text:
+                                    # Admin recebe o relatório completo (todas as casas)
+                                    send_to_ceo(ceo_text)
+                                    # Cada cliente recebe APENAS as seções dos seus restaurantes
+                                    _send_alerts_per_client(ceo_text)
+
+                                # Grupos de gerentes registrados via /register_group
                                 manager_groups = load_manager_groups()
                                 for rest_key, rest_alerts in result.get('per_restaurant', {}).items():
                                     if rest_key in manager_groups:
@@ -1045,10 +2051,10 @@ if __name__ == "__main__":
                                             msg += f"{a}\n\n"
                                         try: bot.send_message(group_id, msg[:4000], parse_mode='Markdown')
                                         except: pass
-                                
+
                                 state['last_alert'] = alert_key
                                 save_state(state)
-                                print(f"[{now}] Alertas proativos enviados.")
+                                print(f"[{now}] Alertas proativos enviados (admin + clientes filtrados).")
                         except Exception as e:
                             print(f"[{now}] Erro nos alertas: {e}")
                 

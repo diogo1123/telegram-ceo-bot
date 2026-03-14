@@ -1,6 +1,7 @@
 import json
 import os
 import glob
+import threading
 from difflib import SequenceMatcher
 import openpyxl
 import requests
@@ -10,6 +11,56 @@ from datetime import datetime, timedelta
 # Import credentials from bot if possible, otherwise hardcode
 NET_USER = os.getenv("NET_USER", "")
 NET_PASS = os.getenv("NET_PASS", "")
+
+# ── Per-client credential context (thread-local para suporte multi-tenant) ────
+_client_ctx = threading.local()
+
+def set_client_context(net_user: str, net_pass: str, restaurants: list, plano: str = "premium"):
+    """Define as credenciais, restaurantes e plano do cliente ativo para esta thread."""
+    _client_ctx.net_user     = net_user
+    _client_ctx.net_pass     = net_pass
+    _client_ctx.restaurants  = restaurants
+    _client_ctx.plano        = plano
+    # is_admin = True apenas quando restaurants=[] (contexto do dono do sistema)
+    _client_ctx.is_admin     = (not restaurants)  # lista vazia → admin
+
+def clear_client_context():
+    """Limpa o contexto do cliente (restaura para credenciais globais)."""
+    _client_ctx.net_user    = None
+    _client_ctx.net_pass    = None
+    _client_ctx.restaurants = None
+    _client_ctx.plano       = None
+    _client_ctx.is_admin    = None
+
+def get_client_plano() -> str:
+    """Retorna o plano do cliente ativo. Admin/sem contexto = premium (acesso total)."""
+    return getattr(_client_ctx, 'plano', None) or "premium"
+
+def _get_creds():
+    """
+    Retorna (net_user, net_pass) para esta thread.
+    REGRA DE SEGURANÇA:
+    - Admin (is_admin=True ou contexto não setado): usa credenciais do env como fallback.
+    - Cliente (is_admin=False, tem restaurantes restritos): NUNCA usa credenciais globais.
+      Se as credenciais do cliente estiverem vazias, retorna strings vazias → auth falha
+      de forma segura em vez de usar acesso de admin inadvertidamente.
+    """
+    u        = getattr(_client_ctx, 'net_user', None)
+    p        = getattr(_client_ctx, 'net_pass', None)
+    is_admin = getattr(_client_ctx, 'is_admin', None)
+
+    # Contexto não inicializado (requisição sem check_auth) → usa admin por segurança
+    if is_admin is None:
+        return (NET_USER, NET_PASS)
+
+    if is_admin:
+        # Admin: fallback para credenciais globais do ambiente
+        return (u or NET_USER, p or NET_PASS)
+    else:
+        # Cliente com restaurantes restritos: NUNCA faz fallback para credenciais de admin
+        if not u or not p:
+            print(f"[SECURITY] Cliente sem credenciais próprias tentou acessar API — bloqueado.")
+        return (u or "", p or "")
 LOGIN_URL = "https://aws.netcontroll.com.br/netadm/api/v1/account/login/"
 PARTNER_LOGIN_URL = "https://aws.netcontroll.com.br/netadm/api/v1/parceiro/login"
 EXPENSES_URL = "https://aws.netcontroll.com.br/netreport/api/v1/netweb/relatorio/financeiro/conta-pagar/plano/periodo"
@@ -159,11 +210,27 @@ def load_json(path):
     except: return []
 
 def find_restaurant_files(rest_name_or_id):
-    rest_name_or_id = str(rest_name_or_id).lower()
-    for r in RESTAURANTS:
-        if rest_name_or_id in r['name'].lower() or rest_name_or_id == str(r['id']):
+    """
+    Retorna o dict do restaurante para este cliente.
+    SEGURANÇA: usa apenas a lista de restaurantes registrados para este cliente
+    (_client_ctx.restaurants). Um cliente nunca acessa dados de outra casa.
+    Se o nome solicitado não estiver na lista permitida, retorna source[0] (casa
+    padrão do cliente) e loga o acesso negado.
+    """
+    query  = str(rest_name_or_id).lower()
+    source = getattr(_client_ctx, 'restaurants', None) or RESTAURANTS
+    for r in source:
+        if query in r['name'].lower() or query == str(r['id']):
             return r
-    return RESTAURANTS[0]
+    # Não encontrado — fallback seguro para o primeiro restaurante do cliente
+    fallback = source[0]
+    # Loga apenas quando havia uma busca específica (não busca vazia)
+    if query and query != fallback['name'].lower():
+        is_admin = getattr(_client_ctx, 'is_admin', True)
+        if not is_admin:
+            print(f"[SECURITY] Acesso negado: '{rest_name_or_id}' não permitido para este cliente. "
+                  f"Permitidos: {[r['name'] for r in source]}. Usando fallback: {fallback['name']}")
+    return fallback
 
 def safe_float(v):
     if v is None: return 0.0
@@ -179,37 +246,23 @@ def normalize_text(text):
 
 def fmt_brl(v, decimals=2):
     """
-    Formata valor monetário brasileiro com abreviação automática para facilitar leitura:
-      >= 1.000.000  → R$ 1,3 mi
-      >= 1.000      → R$ 45,2 mil
-      < 1.000       → R$ 945,50   (formato completo)
+    Formata valor monetário brasileiro exato, sem abreviação:
+      ex: 181280.11 → R$ 181.280,11
+          1308835.73 → R$ 1.308.835,73
+          945.50 → R$ 945,50
 
     Passar decimals=0 para inteiros (ex: quantidades).
     """
     try:
         v = float(v)
-
-        if decimals == 0:
-            # Modo inteiro — sem abreviação, só formata
-            formatted = f"{v:,.0f}"
-            return formatted.replace(",", "X").replace(".", ",").replace("X", ".")
-
         abs_v = abs(v)
         sinal = "-" if v < 0 else ""
-
-        if abs_v >= 1_000_000:
-            # Milhoes: ex 1.308.835,73 -> "1,3 mi"
-            abrev = abs_v / 1_000_000
-            return f"{sinal}R$ {f'{abrev:.1f}'.replace('.', ',')} mi"
-        elif abs_v >= 1_000:
-            # Milhares: ex 181.280,11 -> "181,3 mil"
-            abrev = abs_v / 1_000
-            return f"{sinal}R$ {f'{abrev:.1f}'.replace('.', ',')} mil"
-        else:
-            # Valor pequeno: formato completo
-            formatted = f"{abs_v:,.{decimals}f}"
-            formatted = formatted.replace(",", "X").replace(".", ",").replace("X", ".")
-            return f"{sinal}R$ {formatted}"
+        formatted = f"{abs_v:,.{decimals}f}"
+        # Converte separadores: 1,234,567.89 → 1.234.567,89
+        formatted = formatted.replace(",", "X").replace(".", ",").replace("X", ".")
+        if decimals == 0:
+            return formatted
+        return f"{sinal}R$ {formatted}"
     except:
         return str(v)
 
@@ -302,53 +355,61 @@ def find_best_cost_match(sales_key: str, cost_map: dict, min_score: float = 0.55
 
 
 
-def get_session_for_rest(rest_id):
-    session = requests.Session()
-    session.headers.update({'Content-Type': 'application/json', 'App-Origin': 'Portal'})
-    payload = {'Email': NET_USER, 'Senha': NET_PASS}
-    try:
-        r = session.post(LOGIN_URL, json=payload, timeout=10)
-        if r.status_code == 200:
-            token = r.json().get('data', {}).get('access_token')
-            if token:
-                session.headers.update({'Authorization': f'Bearer {token}'})
-                p_resp = session.post(PARTNER_LOGIN_URL, data=str(rest_id), timeout=10)
-                if p_resp.status_code == 200:
-                    ptoken = p_resp.json().get('data', {}).get('access_token')
-                    if ptoken:
-                        session.headers.update({'Authorization': f'Bearer {ptoken}'})
-                        return session
-    except: pass
-    return None
+def _extract_list(raw):
+    """Extrai lista de uma resposta — suporta lista direta ou envelopes comuns."""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        for key in ('data', 'items', 'result', 'itens', 'produtos', 'estoque'):
+            v = raw.get(key)
+            if isinstance(v, list) and len(v) > 0:
+                return v
+    return []
 
 def fetch_live_stock_data(rest_id):
     """
-    Busca dados de estoque ao vivo tentando primeiro 'listagem-estoque' 
-    (mais detalhado, tem unidade/peso/custo) e depois 'inventario' (simplificado).
+    Busca dados de estoque ao vivo via listagem-estoque (portal #/relatorio/listagem-estoque).
+    Fallback para inventario se necessário.
     """
     session = get_session_for_rest(rest_id)
-    if not session: return []
-    
-    # 1. Tenta listagem-estoque (STOCK_LISTING_URL = portal #/relatorio/listagem-estoque)
-    try:
-        r = session.get(STOCK_LISTING_URL, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and len(data) > 0:
-                print(f"[fetch_live_stock_data] listagem-estoque OK ({len(data)} itens)")
-                return data
-    except: pass
-    
-    # 2. Fallback: inventário (INVENTORY_URL = portal #/estoque/inventario)
-    try:
-        r = session.get(INVENTORY_URL, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and len(data) > 0:
-                print(f"[fetch_live_stock_data] INVENTORY_URL fallback OK ({len(data)} itens)")
-                return data
-    except: pass
-    
+    if not session:
+        print(f"[fetch_live_stock_data] autenticação FALHOU para rest_id={rest_id}")
+        return []
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    date_params = {
+        'DataInicial': f"{today}T03:00:00.000Z",
+        'DataFinal':   f"{today}T03:00:00.000Z",
+    }
+
+    # 1. Tenta listagem-estoque com data de hoje → sem data (caso endpoint não precise)
+    for params in [date_params, {}]:
+        try:
+            r = session.get(STOCK_LISTING_URL, params=params, timeout=30)
+            print(f"[fetch_live_stock_data] listagem-estoque status={r.status_code} params={list(params.keys())}")
+            if r.status_code == 200:
+                rows = _extract_list(r.json())
+                if rows:
+                    print(f"[fetch_live_stock_data] OK — {len(rows)} itens")
+                    return rows
+                print(f"[fetch_live_stock_data] resposta vazia: {str(r.text)[:300]}")
+        except Exception as e:
+            print(f"[fetch_live_stock_data] ERRO listagem-estoque: {e}")
+
+    # 2. Fallback: inventário
+    for params in [date_params, {}]:
+        try:
+            r = session.get(INVENTORY_URL, params=params, timeout=30)
+            print(f"[fetch_live_stock_data] inventory status={r.status_code} params={list(params.keys())}")
+            if r.status_code == 200:
+                rows = _extract_list(r.json())
+                if rows:
+                    print(f"[fetch_live_stock_data] inventory fallback OK — {len(rows)} itens")
+                    return rows
+        except Exception as e:
+            print(f"[fetch_live_stock_data] ERRO inventory: {e}")
+
+    print(f"[fetch_live_stock_data] TODAS as tentativas falharam para rest_id={rest_id}")
     return []
 
 def fetch_sales_data(rest_id, start_date=None, end_date=None):
@@ -716,11 +777,86 @@ def get_ficha_cost_map(rest: dict) -> tuple:
 
 
 def get_revenue(restaurant_name, start_date=None, end_date=None):
+    """Faturamento real por período, usando o relatório de forma de pagamento do portal.
+    Separa venda de produtos da taxa de serviço (10%).
+    Fonte: /relatorio/faturamento-forma-pagamento"""
     rest = find_restaurant_files(restaurant_name)
-    data = fetch_sales_data(rest['id'], start_date, end_date)
-    total = sum([safe_float(item.get('valor', 0)) for item in data])
-    dt_str = start_date if start_date else "ontem"
-    return f"Faturamento total de {rest['name']} ({dt_str}): {fmt_brl(total)}"
+    if not start_date:
+        start_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    if not end_date:
+        end_date = start_date
+
+    session = get_session_for_rest(rest['id'])
+    if not session:
+        return "Erro de autenticação no portal."
+
+    date_start_iso = f"{start_date}T03:00:00.000Z"
+    date_end_iso   = f"{end_date}T03:00:00.000Z"
+
+    try:
+        # 1. Total faturado por forma de pagamento (fonte principal — inclui taxa de serviço)
+        resp = session.get(REVENUE_PAYMENT_URL, params={
+            'DataInicial': date_start_iso,
+            'DataFinal':   date_end_iso,
+        })
+        if resp.status_code != 200:
+            return f"Erro ao acessar faturamento (HTTP {resp.status_code})."
+        payment_data = resp.json() or []
+
+        total_geral = sum(safe_float(i.get('valor', 0)) for i in payment_data)
+        if total_geral == 0:
+            return f"Nenhum faturamento registrado em {rest['name']} no período {start_date} a {end_date}."
+
+        # Agrupamento por forma de pagamento
+        methods: dict = {}
+        for item in payment_data:
+            val  = safe_float(item.get('valor', 0))
+            nome = str(item.get('nome', 'OUTROS')).strip().upper()
+            if val > 0:
+                methods[nome] = methods.get(nome, 0) + val
+
+        # 2. Composição: taxa de serviço vs venda de produtos (via SALES_URL)
+        sales_data = fetch_sales_data(rest['id'], start_date, end_date)
+        taxa_servico = sum(
+            safe_float(row.get('valor', 0))
+            for row in sales_data
+            if 'TAXA' in str(row.get('grupo', '')).upper()
+            or 'TAXA' in str(row.get('subgrupo', '')).upper()
+            or 'TAXA' in str(row.get('nome', '')).upper()
+        )
+        venda_produtos = total_geral - taxa_servico
+
+        # 3. Monta relatório
+        dt_label = start_date if start_date == end_date else f"{start_date} a {end_date}"
+        report = [
+            f"💰 *FATURAMENTO — {rest['name'].upper()}*",
+            f"📅 Período: {dt_label}",
+            "─" * 32,
+            f"💰 *Total recebido: {fmt_brl(total_geral)}*",
+            "",
+            "🧾 *Composição:*",
+            f"  🍽️ Venda de produtos: {fmt_brl(venda_produtos)}",
+            f"  📋 Taxa de serviço:   {fmt_brl(taxa_servico)}",
+            "",
+            "💳 *Por forma de pagamento:*",
+        ]
+        for nome, val in sorted(methods.items(), key=lambda x: x[1], reverse=True):
+            pct = (val / total_geral * 100) if total_geral else 0
+            if "PIX" in nome:
+                emoji = "📱"
+            elif "DINHEIRO" in nome or "ESPECIE" in nome:
+                emoji = "💵"
+            elif "CREDITO" in nome or "DÉBITO" in nome or "DEBITO" in nome or "CARTAO" in nome or "CARTÃO" in nome:
+                emoji = "💳"
+            else:
+                emoji = "📄"
+            report.append(f"  {emoji} {nome}: {fmt_brl(val)} ({fmt_pct(pct)}%)")
+
+        report.append(f"\n📍 _Fonte: /relatorio/faturamento-forma-pagamento_")
+        return "\n".join(report)
+
+    except Exception as e:
+        return f"Erro ao processar faturamento: {e}"
 
 # Mapeamento de termos naturais → grupo do sistema
 _CATEGORY_MAP = {
@@ -1294,9 +1430,10 @@ def get_cmv_report(restaurant_name, query=None, start_date=None, end_date=None):
             continue
         key = normalize_text(nome)
         if key not in sales_agg:
-            sales_agg[key] = {'nome': nome, 'qtde': 0.0, 'receita': 0.0}
-        sales_agg[key]['qtde']    += safe_float(s.get('qtde',  0))
-        sales_agg[key]['receita'] += valor
+            sales_agg[key] = {'nome': nome, 'qtde': 0.0, 'receita': 0.0, 'custo_direto': 0.0}
+        sales_agg[key]['qtde']        += safe_float(s.get('qtde',  0))
+        sales_agg[key]['receita']     += valor
+        sales_agg[key]['custo_direto'] += safe_float(s.get('custo', 0))
 
     faturamento_bruto = sum(v['receita'] for v in sales_agg.values())
     faturamento_total = faturamento_bruto + receita_servico  # para exibição
@@ -1317,7 +1454,8 @@ def get_cmv_report(restaurant_name, query=None, start_date=None, end_date=None):
 
     # Fonte A — ERP (bebidas, itens simples)
     cmv_catalog  = fetch_cmv_data(rest['id'], start_date, end_date)
-    erp_cost_map = {}   # { nome_normalizado: precoCompra }
+    erp_cost_map  = {}   # { nome_normalizado: precoCompra }
+    erp_price_map = {}   # { nome_normalizado: preco (preço de venda cadastrado no ERP) }
     for r in cmv_catalog:
         nome = str(r.get('nome', '')).strip()
         if not nome: continue
@@ -1325,6 +1463,9 @@ def get_cmv_report(restaurant_name, query=None, start_date=None, end_date=None):
         pc = safe_float(r.get('precoCompra', 0))
         if pc > 0:
             erp_cost_map[key] = pc
+        pv = safe_float(r.get('preco', 0))
+        if pv > 0:
+            erp_price_map[key] = pv
 
     # Fonte B — Fichas Técnicas (pratos compostos) — buscada UMA VEZ aqui
     # e reutilizada tanto no CMV Real (fallback) quanto no CMV Teórico
@@ -1332,8 +1473,11 @@ def get_cmv_report(restaurant_name, query=None, start_date=None, end_date=None):
 
     n_erp   = len(erp_cost_map)
     n_ficha = len(ficha_cost)
-    fonte_cmv_real = (f"ERP ({n_erp} simples) + Fichas ({n_ficha} pratos)"
-                      if ficha_cost else f"ERP ({n_erp} produtos)")
+    n_api   = sum(1 for v in sales_agg.values() if v.get('custo_direto', 0) > 0)
+    fonte_cmv_real = (f"API vendas ({n_api} itens c/ custo) + ERP ({n_erp}) + Fichas ({n_ficha})"
+                      if n_api > 0 else
+                      (f"ERP ({n_erp} simples) + Fichas ({n_ficha} pratos)"
+                       if ficha_cost else f"ERP ({n_erp} produtos)"))
 
     # ── 3. CMV Real = qtde_vendida × custo_unit (ERP → Ficha como fallback) ───
     cmv_real_total = 0.0
@@ -1341,28 +1485,42 @@ def get_cmv_report(restaurant_name, query=None, start_date=None, end_date=None):
     sem_custo      = []   # itens sem custo em nenhuma fonte (para debug)
 
     for key, v in sales_agg.items():
-        # Busca na Fonte A (ERP) — exact match + word-based fuzzy
-        custo_unit = find_best_cost_match(key, erp_cost_map)
-        fonte_item = "ERP"
+        # Fonte 0 — custo direto retornado pela API de vendas (IncluirCusto=true)
+        # É o valor mais preciso: já foi acumulado durante a agregação de vendas.
+        if v['custo_direto'] > 0:
+            custo_total = v['custo_direto']
+            custo_unit  = custo_total / v['qtde'] if v['qtde'] > 0 else 0
+            fonte_item  = "API"
+        else:
+            # Fonte A — catálogo ERP (precoCompra × qtde) — exact + fuzzy match
+            custo_unit = find_best_cost_match(key, erp_cost_map)
+            fonte_item = "ERP"
 
-        # Fallback Fonte B (Ficha Técnica) — pratos compostos
-        if custo_unit == 0:
-            fonte_item = "FT"
-            custo_unit = find_best_cost_match(key, ficha_cost)
+            # Fonte B — Ficha Técnica (pratos compostos) — fallback final
+            if custo_unit == 0:
+                fonte_item = "FT"
+                custo_unit = find_best_cost_match(key, ficha_cost)
 
-        if custo_unit == 0:
-            sem_custo.append(v['nome'])
-            continue
+            if custo_unit == 0:
+                sem_custo.append(v['nome'])
+                continue
 
-        custo_total     = v['qtde'] * custo_unit
+            custo_total = v['qtde'] * custo_unit
+
+        # Preço de venda: ERP cadastrado → fallback receita média das vendas
+        preco_venda = find_best_cost_match(key, erp_price_map)
+        if preco_venda == 0 and v['qtde'] > 0:
+            preco_venda = v['receita'] / v['qtde']
+
         cmv_real_total += custo_total
         cmv_real_map[key] = {
-            'nome':    v['nome'],
-            'qtde':    v['qtde'],
-            'custo':   custo_total,
-            'custo_u': custo_unit,
-            'receita': v['receita'],
-            'fonte':   fonte_item,
+            'nome':       v['nome'],
+            'qtde':       v['qtde'],
+            'custo':      custo_total,
+            'custo_u':    custo_unit,
+            'receita':    v['receita'],
+            'preco_venda': preco_venda,
+            'fonte':      fonte_item,
         }
 
     cmv_real_pct = (cmv_real_total / faturamento_bruto * 100) if faturamento_bruto > 0 else 0
@@ -1482,8 +1640,13 @@ def get_cmv_report(restaurant_name, query=None, start_date=None, end_date=None):
             res += "_Esses pratos custaram mais do que previsto nas fichas técnicas:_\n\n"
             for p in piores:
                 e = "🚨" if p['efic'] < 80 else ("⚠️" if p['efic'] < 95 else "✅")
+                pkey = normalize_text(p['nome'])
+                pv   = cmv_real_map.get(pkey, {}).get('preco_venda', 0)
                 res += f"{e} **{p['nome']}** ({fmt_brl(p['qtde'], 0)} unid)\n"
-                res += f"   Custo/porção ficha: {fmt_brl(p['custo_ft'])}\n"
+                res += f"   Custo/porção ficha: {fmt_brl(p['custo_ft'])}"
+                if pv > 0:
+                    res += f"  |  Preço de venda: {fmt_brl(pv)}"
+                res += "\n"
                 res += f"   Teórico: {fmt_brl(p['teorico'])}  |  Real: {fmt_brl(p['real'])}\n"
                 res += f"   Perda: {fmt_brl(p['desvio'])}  (efic. {fmt_pct(p['efic'], 0)}%)\n\n"
 
@@ -1497,21 +1660,31 @@ def get_cmv_report(restaurant_name, query=None, start_date=None, end_date=None):
                 teorico_val = next((t['teorico'] for t in itens_teorico
                                     if normalize_text(t['nome']) == key), 0)
                 pct_real = (v['custo'] / v['receita'] * 100) if v['receita'] > 0 else 0
+                pv = v.get('preco_venda', 0)
+                cu = v.get('custo_u', 0)
+                markup = (pv / cu) if (pv > 0 and cu > 0) else 0
                 itens_det.append({
-                    'nome':    v['nome'],
-                    'qtde':    v['qtde'],
-                    'receita': v['receita'],
-                    'real':    v['custo'],
-                    'custo_u': v.get('custo_u', 0),
-                    'teorico': teorico_val,
-                    'pct':     pct_real,
+                    'nome':       v['nome'],
+                    'qtde':       v['qtde'],
+                    'receita':    v['receita'],
+                    'real':       v['custo'],
+                    'custo_u':    cu,
+                    'preco_venda': pv,
+                    'markup':     markup,
+                    'teorico':    teorico_val,
+                    'pct':        pct_real,
                 })
         if itens_det:
             for it in sorted(itens_det, key=lambda x: x['real'], reverse=True)[:20]:
                 flag = "🚨" if it['pct'] > 35 else ("⚠️" if it['pct'] > 28 else "✅")
                 res += f"{flag} **{it['nome']}** — {fmt_brl(it['qtde'], 0)} unid\n"
-                res += f"   Custo unit (ERP): {fmt_brl(it['custo_u'])}\n"
-                res += f"   Receita: {fmt_brl(it['receita'])}  |  CMV Real: {fmt_brl(it['real'])}  ({fmt_pct(it['pct'])}%)\n"
+                res += f"   Custo unit: {fmt_brl(it['custo_u'])}"
+                if it['preco_venda'] > 0:
+                    res += f"  |  Preço de venda: {fmt_brl(it['preco_venda'])}"
+                if it['markup'] > 0:
+                    res += f"  |  Markup: {it['markup']:.2f}x"
+                res += "\n"
+                res += f"   Receita total: {fmt_brl(it['receita'])}  |  CMV Real: {fmt_brl(it['real'])}  ({fmt_pct(it['pct'])}%)\n"
                 if it['teorico'] > 0:
                     res += (f"   CMV Teórico: {fmt_brl(it['teorico'])}  |  "
                             f"Desvio: {fmt_brl(it['real'] - it['teorico'])}\n")
@@ -1519,7 +1692,52 @@ def get_cmv_report(restaurant_name, query=None, start_date=None, end_date=None):
         else:
             res += f"Nenhum item encontrado para '{query}' no CMV do período.\n"
 
-    return res[:14000]
+    # ── Bloco 5: Listagem completa por produto (sem filtro) ───────────────────
+    # Constrói diretamente do catálogo CMV (listagem-cmv-produto) — tem preco +
+    # precoCompra por produto. Cruza com sales_agg para qtde e receita do período.
+    if not query:
+        catalog_items = []
+        for r in cmv_catalog:
+            nome = str(r.get('nome', '')).strip()
+            if not nome or _is_servico(nome): continue
+            pv  = safe_float(r.get('preco', 0))
+            pc  = safe_float(r.get('precoCompra', 0))
+            if pv == 0 and pc == 0: continue
+            cmv_pct = (pc / pv * 100) if (pv > 0 and pc > 0) else 0
+            markup  = (pv / pc)       if (pv > 0 and pc > 0) else 0
+            key     = normalize_text(nome)
+            qtde    = sales_agg.get(key, {}).get('qtde',    0)
+            receita = sales_agg.get(key, {}).get('receita', 0)
+            catalog_items.append({
+                'nome':    nome,
+                'qtde':    qtde,
+                'preco':   pv,
+                'custo':   pc,
+                'cmv_pct': cmv_pct,
+                'markup':  markup,
+                'receita': receita,
+            })
+        catalog_items.sort(key=lambda x: x['receita'], reverse=True)
+
+        if catalog_items:
+            res += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            res += f"📋 **LISTAGEM CMV POR PRODUTO** ({len(catalog_items)} itens com preço cadastrado)\n"
+            res += "_Fonte: listagem-cmv-produto (portal ERP) — preços e custos reais_\n\n"
+            for it in catalog_items[:50]:
+                flag = "🚨" if it['cmv_pct'] > 35 else ("⚠️" if it['cmv_pct'] > 28 else "✅")
+                qtde_str = f" — {fmt_brl(it['qtde'], 0)} unid" if it['qtde'] > 0 else ""
+                res += f"{flag} **{it['nome']}**{qtde_str}\n"
+                line = []
+                if it['preco'] > 0: line.append(f"Preço venda: {fmt_brl(it['preco'])}")
+                if it['custo'] > 0: line.append(f"CMV unit: {fmt_brl(it['custo'])}")
+                if it['markup'] > 0: line.append(f"Markup: {it['markup']:.2f}x")
+                if it['cmv_pct'] > 0: line.append(f"CMV%: {fmt_pct(it['cmv_pct'])}%")
+                res += "   " + "  |  ".join(line) + "\n"
+                if it['receita'] > 0:
+                    res += f"   Receita período: {fmt_brl(it['receita'])}\n"
+                res += "\n"
+
+    return res[:20000]
 
 
 def get_expenses(restaurant_name, query=None, start_date=None, end_date=None):
@@ -1663,22 +1881,36 @@ def get_expenses(restaurant_name, query=None, start_date=None, end_date=None):
     return res
 
 def get_session_for_rest(rest_id):
+    u, p = _get_creds()
     session = requests.Session()
     session.headers.update({'Content-Type': 'application/json', 'App-Origin': 'Portal'})
-    payload = {'Email': NET_USER, 'Senha': NET_PASS}
+    payload = {'Email': u, 'Senha': p}
     try:
         r = session.post(LOGIN_URL, json=payload, timeout=10)
-        if r.status_code == 200:
-            token = r.json().get('data', {}).get('access_token')
-            if token:
-                session.headers.update({'Authorization': f'Bearer {token}'})
-                p_resp = session.post(PARTNER_LOGIN_URL, data=str(rest_id), timeout=10)
-                if p_resp.status_code == 200:
-                    ptoken = p_resp.json().get('data', {}).get('access_token')
-                    if ptoken:
-                        session.headers.update({'Authorization': f'Bearer {ptoken}'})
-                        return session
-    except: pass
+        if r.status_code != 200:
+            print(f"[auth] LOGIN FALHOU rest_id={rest_id} status={r.status_code}")
+            return None
+        token = r.json().get('data', {}).get('access_token')
+        if not token:
+            print(f"[auth] LOGIN sem token rest_id={rest_id}")
+            return None
+        session.headers.update({'Authorization': f'Bearer {token}'})
+        p_resp = session.post(PARTNER_LOGIN_URL, data=str(rest_id), timeout=10)
+        if p_resp.status_code != 200:
+            print(f"[auth] PARTNER LOGIN FALHOU rest_id={rest_id} status={p_resp.status_code}")
+            return None
+        resp_data = p_resp.json().get('data', {})
+        ptoken = resp_data.get('access_token')
+        # Log para detectar mistura de restaurante: o campo 'parceiro' ou similar pode revelar qual restaurante foi autenticado
+        rest_info = resp_data.get('parceiro') or resp_data.get('restaurant') or resp_data.get('nome') or resp_data.get('name') or resp_data.get('empresa')
+        print(f"[auth] PARTNER LOGIN OK rest_id={rest_id} → info={rest_info}")
+        if not ptoken:
+            print(f"[auth] PARTNER LOGIN sem ptoken rest_id={rest_id} resp={list(resp_data.keys())}")
+            return None
+        session.headers.update({'Authorization': f'Bearer {ptoken}'})
+        return session
+    except Exception as e:
+        print(f"[auth] EXCEÇÃO rest_id={rest_id}: {e}")
     return None
 
 def apply_price_change(restaurant_name, product_name, price_change):
@@ -1713,11 +1945,20 @@ def apply_price_change(restaurant_name, product_name, price_change):
         else:
             novo_preco = preco_antigo + float(str_change)
             
+        # ── Regra de negócio: preço NUNCA pode diminuir via bot ──────────────
+        if novo_preco <= preco_antigo:
+            return (
+                f"🚫 **Operação bloqueada.**\n\n"
+                f"🍔 Item: {match['nome']} ({rest['name']})\n"
+                f"💰 Preço atual: {fmt_brl(preco_antigo)}\n"
+                f"❌ Preço calculado: {fmt_brl(novo_preco)}\n\n"
+                "A política do sistema **não permite redução de preços via bot**.\n"
+                "Para reduções, acesse o portal manualmente."
+            )
+
         data['preco'] = novo_preco
         data['precoVenda'] = novo_preco
-        
-        # Emulating PUT because destructive action might need exact JSON format
-        # If API rejects, we still show the calculation to CEO
+
         r_put = session.put(f"{PRODUCT_URL}/{pid}", json=data)
         if r_put.status_code in [200, 201, 204]:
             return f"✅ **SUCESSO! ERP ATUALIZADO.**\n\n🍔 Item: {match['nome']} ({rest['name']})\n📉 Preço Antigo: {fmt_brl(preco_antigo)}\n📈 **Novo Preço:** {fmt_brl(novo_preco)}\n\nO reajuste já está valendo no PDV."
@@ -2264,13 +2505,17 @@ def get_realtime_fraud_alert(restaurant_name):
 def get_dynamic_pricing_suggestions(restaurant_name):
     weather_info = get_weather_forecast(restaurant_name)
     is_sunny = "sol" in weather_info.lower() or "limpo" in weather_info.lower()
-    
+
     rest = find_restaurant_files(restaurant_name)
-    stock_path = rest.get('stock_file')
-    if not stock_path or not os.path.exists(stock_path):
-        return f"Não tenho acesso ao estoque em tempo real de {rest['name']} para cruzar a precificação."
-        
-    stock_data = load_json(stock_path)
+
+    # Busca estoque ao vivo (API); fallback para arquivo local se necessário
+    stock_data = fetch_live_stock_data(rest['id'])
+    if not stock_data:
+        stock_path = rest.get('stock_file')
+        if stock_path and os.path.exists(stock_path):
+            stock_data = load_json(stock_path)
+    if not stock_data:
+        return f"Estoque indisponível para {rest['name']} no momento. Tente novamente em instantes."
     
     overstocked = []
     for row in stock_data:
@@ -2292,16 +2537,19 @@ def get_dynamic_pricing_suggestions(restaurant_name):
     else:
         report += "A previsão indica CHUVA ou TEMPO NUBLADO.\n"
         report += "A expectativa de ocupação é **BAIXA a MODERADA**.\n\n"
-        report += "💡 **Sugestão de Estímulo (Giro Rápido):**\n"
-        report += "  • **Day Use / Couvert:** Reduzir em 20% para não perder o dia e atrair o público que hesita em sair de casa. O ticket médio se salva na alimentação e bebida.\n"
+        report += "💡 **Sugestões para Dias de Chuva (sem reduzir preços):**\n"
+        report += "  • **Combo Chuva:** Crie um pacote Day Use + prato quente + drink à vontade a um preço superior ao Day Use avulso. Ticket médio sobe sem cortar margem.\n"
+        report += "  • **Upsell de Bebidas Quentes:** Destaque quentinhos, chocolates quentes e drinks clássicos no cardápio digital — itens de alta margem ideais para o clima.\n"
+        report += "  • **Leve 2 Pague 1 em petiscos:** Gira estoque de acompanhamentos sem mexer no preço unitário — cliente percebe promoção, você mantém o posicionamento.\n"
+        report += "  • **Evento Temático / Happy Hour:** Crie um evento de faturamento mínimo por mesa com cardápio degustação — preço por cabeça igual ou acima do Day Use normal.\n"
         
     if overstocked:
         report += "\n📦 **Oportunidades de Giro (Capital Parado):**\n"
         for item in overstocked[:3]:
             report += f"  • **{item['nome']}** - Estoque perigosamente alto: {fmt_brl(item['qtd'], 0)} unid ({fmt_brl(item['custo_total'])} empatados em prateleira).\n"
-            report += f"    _Ação: Baixar o preço em 5% no ERP agora mesmo, ou criar Promoção 'Compre 4 Leve 5' para desafogar o caixa._\n"
+            report += f"    _Ação: Criar promoção 'Compre 4 Leve 5' ou incluir em combo (sem reduzir preço unitário) para desafogar o caixa._\n"
             
-    report += "\n⚡ _Seja agressivo! Quer que eu conecte no ERP e aplique o reajuste agorinha mesmo? Diga: 'Aumente o preço do Day Use em 10%'_"
+    report += "\n⚡ _Quer aplicar o ajuste de preço? Diga: 'Aumente o preço do Day Use em 10%' — somente aumentos são permitidos via bot._"
     return report
 
 def get_predictive_hr_scale(restaurant_name, target_date=None):
@@ -2600,129 +2848,306 @@ def get_purchasing_plan(restaurant_name, query=None, days_history=7, coverage_da
     report += f"💰 **Estimativa Total do Pedido: {fmt_brl(total_cost)}**\n\n"
     report += "_Nota: Este cálculo utiliza os ingredientes da Ficha Técnica + Faturamento Real._"
     
-    return report[:14000] # Prevenção rigorosa de erro 429 de limite de Tokens OpenAI
+    return report[:6000]  # Limita o payload enviado ao OpenAI (evita context overflow)
+
+def _load_snapshot_items(rest_name: str, date_str: str) -> tuple:
+    """Retorna ({insumo_norm: {nome, qty, custo}}, fonte_str) do snapshot mais próximo (±3 dias)."""
+    safe_name = rest_name.replace(" ", "_").replace("/", "_")
+    target = datetime.strptime(date_str, '%Y-%m-%d')
+    for delta in range(4):
+        for sign in ([0] if delta == 0 else [1, -1]):
+            d     = target + timedelta(days=delta * sign)
+            label = d.strftime('%d/%m/%Y')
+            fname = f"{safe_name}_{d.strftime('%Y-%m-%d')}.json"
+            data  = None
+            path  = os.path.join(SNAPSHOTS_DIR, fname)
+            if os.path.exists(path):
+                data = load_json(path)
+            if not data and _gist_enabled():
+                data = _gist_load(fname)
+            if data:
+                items = {}
+                for row in data:
+                    nome = str(row.get('produto', '')).strip()
+                    if not nome: continue
+                    k = normalize_text(nome)
+                    if k not in items:
+                        items[k] = {'nome': nome, 'qty': 0.0, 'custo': 0.0}
+                    items[k]['qty']  += safe_float(row.get('estoqueAtual', 0))
+                    items[k]['custo'] = max(items[k]['custo'], safe_float(row.get('custoAtual', 0)))
+                return items, f"snapshot {label} ({len(items)} itens)"
+    return {}, "sem snapshot — execute /salvar_estoque no início do período"
+
+
+def _find_latest_snapshot(rest_name: str, max_days_back: int = 35) -> tuple:
+    """Encontra o snapshot mais recente disponível (até max_days_back dias atrás).
+    Retorna ({insumo_norm: {nome,qty,custo}}, date_str_YYYY-MM-DD, label_str)
+    Procura backward de ontem até max_days_back — skips today (EF, não EI).
+    """
+    safe_name = rest_name.replace(" ", "_").replace("/", "_")
+    today = datetime.now()
+    for delta in range(1, max_days_back + 1):
+        d     = today - timedelta(days=delta)
+        fname = f"{safe_name}_{d.strftime('%Y-%m-%d')}.json"
+        data  = None
+        path  = os.path.join(SNAPSHOTS_DIR, fname)
+        if os.path.exists(path):
+            data = load_json(path)
+        if not data and _gist_enabled():
+            data = _gist_load(fname)
+        if data:
+            items = {}
+            for row in data:
+                nome = str(row.get('produto', '')).strip()
+                if not nome: continue
+                k = normalize_text(nome)
+                if k not in items:
+                    items[k] = {'nome': nome, 'qty': 0.0, 'custo': 0.0}
+                items[k]['qty']  += safe_float(row.get('estoqueAtual', 0))
+                items[k]['custo'] = max(items[k]['custo'], safe_float(row.get('custoAtual', 0)))
+            if items:
+                date_str = d.strftime('%Y-%m-%d')
+                label    = f"snapshot {d.strftime('%d/%m/%Y')} ({len(items)} itens)"
+                return items, date_str, label
+    return {}, None, "sem snapshot"
+
+
+def _classify_insumo(nome: str) -> str:
+    n = nome.lower()
+    if any(k in n for k in ['aperol', 'vodka', 'gin', 'whisky', 'rum', 'cachaça', 'licor',
+                              'campari', 'cerveja', 'heineken', 'amstel', 'eisenbahn', 'stella',
+                              'brahma', 'vinho', 'espumante', 'dose', 'destilad', 'caipir',
+                              'limoncello', 'cointreau', 'baileys', 'long neck', 'chopp']):
+        return '🍺 Bebidas Alcoólicas'
+    if any(k in n for k in ['coca', 'pepsi', 'suco', 'água', 'guaraná', 'energético',
+                              'ice tea', 'limonada', 'refrigerante', 'tônica', 'schweppes',
+                              'ginger', 'leite de coco', 'agua de coco']):
+        return '🥤 Bebidas Não-Alcoólicas'
+    if any(k in n for k in ['frango', 'carne', 'peixe', 'camarão', 'filé', 'file',
+                              'costela', 'bife', 'salmo', 'atum', 'bacon', 'linguiça', 'isca']):
+        return '🥩 Proteínas'
+    if any(k in n for k in ['laranja', 'limão', 'limao', 'tomate', 'cebola', 'alho',
+                              'salsa', 'coentro', 'hortelã', 'maracujá', 'morango', 'manga',
+                              'abacaxi', 'folha', 'pera', 'taiti', 'legum', 'verdura']):
+        return '🥬 Hortifruti'
+    return '🧂 Secos/Mercearia'
+
+
+_BENCH_LOSS_PCT = {
+    '🍺 Bebidas Alcoólicas':    3.0,
+    '🥤 Bebidas Não-Alcoólicas': 2.0,
+    '🥬 Hortifruti':            10.0,
+    '🥩 Proteínas':              5.0,
+    '🧂 Secos/Mercearia':        1.0,
+}
+
 
 def get_waste_audit(restaurant_name, query=None, days_history=7):
     try: days_history = int(days_history)
     except: days_history = 7
     
-    start_date = (datetime.now() - timedelta(days=days_history)).strftime('%Y-%m-%d')
     end_date = datetime.now().strftime('%Y-%m-%d')
-    
-    rest = find_restaurant_files(restaurant_name)
-    sales = fetch_sales_data(rest['id'], start_date, end_date)
-    inbound_data = fetch_inbound_data(rest['id'], start_date, end_date)
-    
-    sales_map = {}
-    for r in sales:
-        n = normalize_text(str(r.get('nome', '')))
-        if n: sales_map[n] = sales_map.get(n, 0) + safe_float(r.get('qtde', 0))
-        
-    inbound_map = {}
-    if inbound_data:
-        for r in inbound_data:
-            n = normalize_text(str(r.get('produto', '')))
-            if n: inbound_map[n] = inbound_map.get(n, 0) + safe_float(r.get('qtde', 0))
-        
-    ingredient_demand = dict(sales_map)
-    recipe_path = rest.get('recipe_file')
-    if recipe_path and os.path.exists(recipe_path):
-        try:
-            wb = openpyxl.load_workbook(recipe_path, data_only=True)
-            ws = wb.active
-            current_dish = None
-            recipes = {}
-            for row in ws.iter_rows(min_row=1, values_only=True):
-                r0 = str(row[0]).strip() if row[0] else ""
-                r1 = str(row[1]).strip() if len(row) > 1 and row[1] else ""
-                if r0.startswith("Produto:") or (r0 and not r1 and not r0.replace('.','').isdigit() and not r0.startswith("Subgrupo:")):
-                    current_dish = normalize_text(r0.split(":", 1)[1]) if ":" in r0 else normalize_text(r0)
-                    recipes[current_dish] = []
-                elif current_dish and len(row) >= 4:
-                    if isinstance(row[2], (int, float)):
-                        ing_name = normalize_text(str(row[1])) if row[1] else ""
-                        ing_qty = safe_float(row[2])
-                        if ing_name and ing_qty > 0:
-                            recipes[current_dish].append((ing_name, ing_qty))
-                            
-            for sn, qty_sold in sales_map.items():
-                for dish, ingr_list in recipes.items():
-                    if sn == dish:
-                        for ing_name, ing_qty in ingr_list:
-                            ingredient_demand[ing_name] = ingredient_demand.get(ing_name, 0) + (qty_sold * ing_qty)
-        except: pass
-        
-    stock_path = rest.get('stock_file')
-    if not stock_path or not os.path.exists(stock_path):
-        return f"Lista de Estoque inacessível para {rest['name']}."
-        
-    stock_data = load_json(stock_path)
-    
-    stock_map = {}
-    for row in stock_data:
+    rest     = find_restaurant_files(restaurant_name)
+    _SKIP    = {'day use', 'dayuse', 'day-use', 'couvert', 'ao ponto', 'bem passada'}
+
+    # ── 0. Encontra snapshot EI mais recente — define o período automaticamente ─
+    # Procura o snapshot mais recente (pode ser desta semana, com poucos dias)
+    # e usa a data dele como start_date. Isso garante que o cálculo
+    # EI + Entradas − EF = Consumo Real seja correto independente dos dias.
+    ei_map, ei_date, ei_fonte = _find_latest_snapshot(rest['name'])
+    if ei_date:
+        start_date   = ei_date
+        days_history = (datetime.now() - datetime.strptime(ei_date, '%Y-%m-%d')).days
+    else:
+        start_date = (datetime.now() - timedelta(days=days_history)).strftime('%Y-%m-%d')
+    tem_ei = len(ei_map) > 0
+
+    # ── 1. Vendas do período ──────────────────────────────────────────────────
+    sales_data   = fetch_sales_data(rest['id'], start_date, end_date)
+    sales_map    = {}   # { prato_norm: qtde }
+    receita_total = 0.0
+    for r in sales_data:
+        nome = str(r.get('nome', '')).strip()
+        if not nome or any(k in nome.lower() for k in _SKIP): continue
+        k = normalize_text(nome)
+        sales_map[k] = sales_map.get(k, 0) + safe_float(r.get('qtde', 0))
+        receita_total += safe_float(r.get('valor', 0))
+
+    # ── 2. Fichas Técnicas → demanda teórica por insumo ──────────────────────
+    # Fonte primária: API de Composições (compostoNome + composicaoNome + quantidade)
+    comp_rows  = fetch_composition_data(rest['id'])
+    dish_ingr  = {}   # { prato_norm: [{norm, nome, qty}] }
+    for row in comp_rows:
+        dish = normalize_text(str(row.get('compostoNome', '')))
+        ingr = str(row.get('composicaoNome', '')).strip()
+        qty  = safe_float(row.get('quantidade', 0))
+        if not dish or not ingr or qty <= 0: continue
+        dish_ingr.setdefault(dish, []).append({
+            'norm': normalize_text(ingr), 'nome': ingr, 'qty': qty
+        })
+
+    # ingredient_demand: { insumo_norm: {nome, qty_teorica, pratos[]} }
+    ingredient_demand = {}
+    for prato_norm, qtde_vendida in sales_map.items():
+        ingrs = dish_ingr.get(prato_norm, [])
+        if not ingrs:  # fuzzy fallback
+            for dn, il in dish_ingr.items():
+                wa = set(prato_norm.split()); wb2 = set(dn.split())
+                if wa and wb2 and len(wa & wb2) / len(wa | wb2) >= 0.5:
+                    ingrs = il; break
+        for ingr in ingrs:
+            k = ingr['norm']
+            ingredient_demand.setdefault(k, {'nome': ingr['nome'], 'qty': 0.0, 'pratos': []})
+            ingredient_demand[k]['qty'] += qtde_vendida * ingr['qty']
+            if ingr['nome'] not in ingredient_demand[k]['pratos']:
+                ingredient_demand[k]['pratos'].append(ingr['nome'])
+
+    fonte_fichas = (f"API Composições ({len(dish_ingr)} pratos)" if dish_ingr
+                    else "fichas indisponíveis — cadastre as composições no portal")
+
+    # ── 3. Estoque Final — EF (hoje, via API) ─────────────────────────────────
+    ef_raw = fetch_live_stock_data(rest['id'])
+    ef_map = {}   # { insumo_norm: {nome, qty, custo} }
+    for row in ef_raw:
         nome = str(row.get('produto', '')).strip()
-        n_norm = normalize_text(nome)
-        if len(n_norm) < 3: continue
-        
+        if not nome or any(k in nome.lower() for k in _SKIP): continue
         if query:
-            grupo = str(row.get('grupo', ''))
+            grupo    = str(row.get('grupo', ''))
             subgrupo = str(row.get('subgrupo', ''))
             if not (match_query(query, nome) or match_query(query, grupo) or match_query(query, subgrupo)):
                 continue
-                
-        if n_norm not in stock_map:
-            stock_map[n_norm] = {
-                'nome': nome,
-                'estoqueAtual': safe_float(row.get('estoqueAtual', 0)),
-                'custoAtual': safe_float(row.get('custoAtual', 0))
-            }
-        else:
-            stock_map[n_norm]['estoqueAtual'] += safe_float(row.get('estoqueAtual', 0))
-            stock_map[n_norm]['custoAtual'] = max(stock_map[n_norm]['custoAtual'], safe_float(row.get('custoAtual', 0)))
+        k = normalize_text(nome)
+        if k not in ef_map:
+            ef_map[k] = {'nome': nome, 'qty': 0.0, 'custo': 0.0}
+        ef_map[k]['qty']  += safe_float(row.get('estoqueAtual', 0))
+        ef_map[k]['custo'] = max(ef_map[k]['custo'], safe_float(row.get('custoAtual', 0)))
 
-    audit_results = []
-    
-    for n_norm, data in stock_map.items():
-        if 'DAY USE' in n_norm.upper() or 'PONTO' in n_norm.upper() or 'PASSADA' in n_norm.upper() or 'COUVERT' in n_norm.upper():
-            continue
-            
-        qty_sold_theoretical = ingredient_demand.get(n_norm, 0)
-        current_stock = data['estoqueAtual']
-        inbound_qty = inbound_map.get(n_norm, 0)
-        
-        if qty_sold_theoretical > 0 or inbound_qty > 0 or query:
-            audit_results.append({
-                'nome': data['nome'],
-                'theoretical_consumed': qty_sold_theoretical,
-                'system_stock': current_stock,
-                'inbound': inbound_qty,
-                'cost': data['custoAtual']
+    if not ef_map and not query:
+        return (f"⚠️ Estoque indisponível para {rest['name']} no momento.\n"
+                f"Verifique o portal: #{'/relatorio/listagem-estoque'}")
+
+    # ── 4. Entradas/Compras do período ───────────────────────────────────────
+    inbound_data = fetch_inbound_data(rest['id'], start_date, end_date)
+    ent_map      = {}   # { insumo_norm: {nome, qty, valor} }
+    for row in inbound_data:
+        nome = str(row.get('produto', '')).strip()
+        if not nome: continue
+        k = normalize_text(nome)
+        ent_map.setdefault(k, {'nome': nome, 'qty': 0.0, 'valor': 0.0})
+        ent_map[k]['qty']   += safe_float(row.get('qtde', 0))
+        ent_map[k]['valor'] += safe_float(row.get('valorTotal', 0))
+
+    # ── 6. Cruzamento — cálculo por insumo ────────────────────────────────────
+    resultados = []
+    candidatos = set(ef_map.keys()) if ef_map else set(ingredient_demand.keys())
+
+    for k in candidatos:
+        ef_item  = ef_map.get(k, {})
+        nome     = ef_item.get('nome') or ingredient_demand.get(k, {}).get('nome', k)
+        ef_qty   = ef_item.get('qty', 0.0)
+        custo_u  = ef_item.get('custo', 0.0)
+        ei_entry = ei_map.get(k)
+        ei_qty   = ei_entry['qty'] if ei_entry else None
+        ent_qty  = ent_map.get(k, {}).get('qty', 0.0)
+        ent_val  = ent_map.get(k, {}).get('valor', 0.0)
+        teorico  = ingredient_demand.get(k, {}).get('qty', 0.0)
+        pratos   = ingredient_demand.get(k, {}).get('pratos', [])
+
+        # Consumo Real = EI + Entradas − EF  (só disponível com snapshot EI)
+        consumo_real = (ei_qty + ent_qty - ef_qty) if ei_qty is not None else None
+
+        # Desvio = Consumo Real − Consumo Teórico
+        if consumo_real is not None and teorico > 0:
+            desvio      = consumo_real - teorico
+            pct_perda   = desvio / teorico * 100
+            valor_perda = max(desvio, 0) * custo_u
+        elif consumo_real is not None and teorico == 0:
+            desvio = consumo_real; pct_perda = None; valor_perda = consumo_real * custo_u
+        else:
+            desvio = None; pct_perda = None; valor_perda = None
+
+        if teorico > 0 or ent_qty > 0 or query:
+            resultados.append({
+                'nome': nome, 'categoria': _classify_insumo(nome),
+                'ei_qty': ei_qty, 'ent_qty': ent_qty, 'ef_qty': ef_qty,
+                'custo_u': custo_u, 'consumo_real': consumo_real,
+                'teorico': teorico, 'desvio': desvio,
+                'pct_perda': pct_perda, 'valor_perda': valor_perda,
+                'pratos': pratos, 'tem_ei': ei_qty is not None,
             })
-            
-    # Sort by value of consumed goods (highest tracking priority)
-    audit_results.sort(key=lambda x: max(x['theoretical_consumed'], x['inbound']) * x['cost'], reverse=True)
-    
-    if not audit_results:
-        return f"✅ Nenhum item rastreável encontrado para a auditoria em {rest['name']}."
-        
-    q_lbl = f" | Foco: {query.upper()}" if query else " | Foco: Itens Mais Consumidos"
-    report = f"🕵️ **AUDITORIA REAL VS. TEÓRICA (Detecção de Quebras)**\n"
-    report += f"🏠 {rest['name']} | Base Vendas/Entradas: {days_history} últimos dias{q_lbl}\n\n"
-    report += "⚠️ *Instrução CEO:* Vá fisicamente ao Freezer/Estoque e faça a contagem cega dos itens abaixo. O Consumo Real é calculado como: (Estoque Anterior + Compras) - Saldo Físico.\n\n"
-    
-    for a in audit_results[:35]: # Limit output to top 35 to save tokens
-        cost_str = f"{fmt_brl(a['cost'])}" if a['cost'] > 0 else "N/A"
-        report += f"📍 **{a['nome']}** (Custo ref: {cost_str})\n"
-        report += f"  - Consumo Teórico (Vendas x Ficha): **{fmt_brl(a['theoretical_consumed'])}** unid/kg/L\n"
-        report += f"  - Entradas de Mercadoria (Compras): **{fmt_brl(a['inbound'])}** unid/kg/L\n"
-        report += f"  - Saldo no Sistema Hoje: **{fmt_brl(a['system_stock'])}** unid/kg/L\n"
-        report += f"  - Saldo Físico Encontrado: [        ] unid/kg/L\n"
-        report += f"  - Consumo Real Apurado: [        ] unid/kg/L\n\n"
-        
-    if len(audit_results) > 35:
-        report += f"_... e mais {len(audit_results) - 35} itens. Seja mais específico na busca caso o insumo suspeito não esteja listado._\n"
-        
-    return report[:14000]
+
+    resultados.sort(key=lambda x: (x['valor_perda'] or 0), reverse=True)
+
+    # ── 7. Relatório ──────────────────────────────────────────────────────────
+    q_lbl = f" — Foco: {query.upper()}" if query else ""
+    rep   = f"🕵️ **AUDITORIA DE RUPTURAS / DESPERDÍCIO{q_lbl}**\n"
+    rep  += f"🏠 {rest['name']}  |  📅 {start_date} a {end_date} ({days_history} dias)\n"
+    if receita_total > 0:
+        rep += f"💰 Faturamento F&B no período: {fmt_brl(receita_total)}\n"
+    rep  += "\n📋 **Fontes de dados:**\n"
+    rep  += f"  {'✅' if ef_map else '⚠️'} EF (estoque atual): {len(ef_map)} itens\n"
+    rep  += f"  {'✅' if tem_ei else '⚠️'} EI (estoque inicial): {ei_fonte}\n"
+    rep  += f"  {'✅' if ent_map else '⚠️'} Entradas/Compras: {len(ent_map)} produtos no período\n"
+    rep  += f"  {'✅' if dish_ingr else '⚠️'} Fichas Técnicas: {fonte_fichas}\n"
+    if not tem_ei:
+        rep += "\n⚠️ **SEM SNAPSHOT DE EI** — Consumo Real não calculável automaticamente.\n"
+        rep += "   Como resolver: execute /salvar_estoque no início de cada período de análise.\n"
+        rep += "   Por ora, mostrando Consumo Teórico vs. EF (saldo atual).\n"
+    rep += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    com_desvio   = [r for r in resultados if r['desvio'] is not None and r['desvio'] > 0]
+    sem_ei_items = [r for r in resultados if not r['tem_ei'] and r['teorico'] > 0]
+
+    if com_desvio:
+        rep += f"🔴 **INSUMOS COM PERDA DETECTADA — {len(com_desvio)} itens**\n\n"
+        for i, r in enumerate(com_desvio[:20], 1):
+            bench = _BENCH_LOSS_PCT.get(r['categoria'], 3.0)
+            flag  = "🔴" if (r['pct_perda'] or 0) > bench else ("🟡" if (r['pct_perda'] or 0) > bench * 0.5 else "🟢")
+            rep  += f"{i}. **{r['nome']}** {r['categoria']}\n"
+            rep  += f"   📦 EI: {r['ei_qty']:.3f}  +  📥 Entradas: {r['ent_qty']:.3f}  −  📦 EF: {r['ef_qty']:.3f}\n"
+            rep  += f"   📉 Consumo Real: {r['consumo_real']:.3f} unid\n"
+            if r['teorico'] > 0:
+                pratos_str = ', '.join(r['pratos'][:3]) + ('...' if len(r['pratos']) > 3 else '')
+                rep += f"   📐 Consumo Teórico: {r['teorico']:.3f} unid (via: {pratos_str})\n"
+            rep  += f"   {flag} DIFERENÇA: +{r['desvio']:.3f} unid = {fmt_brl(r['valor_perda'])}"
+            if r['pct_perda'] is not None:
+                rep += f" ({r['pct_perda']:.1f}% — bench ≤{bench}%)"
+            rep  += "\n"
+            if r['custo_u'] > 0:
+                rep += f"   Custo ref: {fmt_brl(r['custo_u'])}/unid\n"
+            rep  += "\n"
+        rep += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    elif sem_ei_items:
+        rep += f"🟡 **CONSUMO TEÓRICO vs. ESTOQUE ATUAL** (sem EI para {len(sem_ei_items)} itens)\n\n"
+        for i, r in enumerate(sem_ei_items[:20], 1):
+            rep += f"{i}. **{r['nome']}** {r['categoria']}\n"
+            rep += f"   📦 EF (hoje): {r['ef_qty']:.3f}  |  📥 Entradas: {r['ent_qty']:.3f}\n"
+            pratos_str = ', '.join(r['pratos'][:2]) + ('...' if len(r['pratos']) > 2 else '')
+            rep += f"   📐 Consumo Teórico: {r['teorico']:.3f} unid (via: {pratos_str})\n"
+            if r['custo_u'] > 0:
+                rep += f"   Custo ref: {fmt_brl(r['custo_u'])}/unid\n"
+            rep += "\n"
+        rep += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    else:
+        rep += "✅ Nenhuma divergência detectada com os dados disponíveis.\n\n"
+
+    # Resumo financeiro por categoria
+    if com_desvio:
+        cat_totals: dict = {}
+        for r in com_desvio:
+            c = r['categoria']
+            cat_totals.setdefault(c, {'valor': 0.0, 'count': 0})
+            cat_totals[c]['valor'] += r['valor_perda'] or 0
+            cat_totals[c]['count'] += 1
+        total_perda = sum(v['valor'] for v in cat_totals.values())
+        rep += "💰 **RESUMO FINANCEIRO DE PERDAS**\n\n"
+        for cat, v in sorted(cat_totals.items(), key=lambda x: -x[1]['valor']):
+            rep += f"  {cat}: {fmt_brl(v['valor'])} ({v['count']} itens)\n"
+        rep += f"\n  **TOTAL DE PERDAS ESTIMADAS: {fmt_brl(total_perda)}**\n\n"
+
+    return rep[:18000]
 
 def get_menu_engineering(restaurant_name, start_date=None, end_date=None):
     if not start_date: start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
@@ -4704,39 +5129,53 @@ def get_payment_report(restaurant_name, start_date, end_date=None):
         if not data:
             return f"Nenhum faturamento registrado no {rest['name']} no período de {start_date} a {end_date}."
             
-        # Analysis
+        # Agrupa por forma de pagamento
         total_revenue = 0
         methods = {}
-        
         for item in data:
-            val = safe_float(item.get('valor', 0))
+            val  = safe_float(item.get('valor', 0))
             name = str(item.get('nome', 'OUTROS')).strip().upper()
-            
             if val > 0:
                 total_revenue += val
                 methods[name] = methods.get(name, 0) + val
-        
-        # Sort by value
+
         sorted_methods = sorted(methods.items(), key=lambda x: x[1], reverse=True)
-        
+
+        # Composição: taxa de serviço via SALES_URL
+        sales_data = fetch_sales_data(rest['id'], start_date, end_date)
+        taxa_servico = sum(
+            safe_float(row.get('valor', 0))
+            for row in sales_data
+            if 'TAXA' in str(row.get('grupo', '')).upper()
+            or 'TAXA' in str(row.get('subgrupo', '')).upper()
+            or 'TAXA' in str(row.get('nome', '')).upper()
+        )
+        venda_produtos = total_revenue - taxa_servico
+
         report = []
-        report.append(f"💳 **FATURAMENTO POR FORMA DE PAGAMENTO: {rest['name'].upper()}**")
-        report.append(f"📅 Período: {start_date} até {end_date}")
-        report.append(f"---")
-        report.append(f"💰 **Faturamento Total: {fmt_brl(total_revenue)}**")
+        report.append(f"💳 *FATURAMENTO POR FORMA DE PAGAMENTO: {rest['name'].upper()}*")
+        report.append(f"📅 Período: {start_date} a {end_date}")
+        report.append("─" * 32)
+        report.append(f"💰 *Total recebido: {fmt_brl(total_revenue)}*")
         report.append("")
-        
-        report.append("📊 **DISTRIBUIÇÃO DE RECEBIMENTOS:**")
+        report.append("🧾 *Composição:*")
+        report.append(f"  🍽️ Venda de produtos: {fmt_brl(venda_produtos)}")
+        report.append(f"  📋 Taxa de serviço:   {fmt_brl(taxa_servico)}")
+        report.append("")
+        report.append("💳 *Por forma de pagamento:*")
         for name, val in sorted_methods:
             perc = (val / total_revenue * 100) if total_revenue > 0 else 0
-            # Friendly emojis for methods
-            emoji = "💵" if "DINHEIRO" in name else "📱" if "PIX" in name else "💳" if "CARTAO" in name or "CREDITO" in name or "DEBITO" in name else "📄"
-            report.append(f"{emoji} **{name}**: {fmt_brl(val)} ({fmt_pct(perc)}%)")
-            
-        report.append("\n---")
-        report.append("💡 *Dica do Gestor:* Um alto percentual de Pix ajuda no fluxo de caixa imediato (D+0). Já altas taxas de cartões de crédito impactam a margem líquida devido às taxas das operadoras.")
-        report.append("📍 _Fonte: /relatorio/faturamento-forma-pagamento_")
-        
+            if "PIX" in name:
+                emoji = "📱"
+            elif "DINHEIRO" in name or "ESPECIE" in name:
+                emoji = "💵"
+            elif "CREDITO" in name or "DÉBITO" in name or "DEBITO" in name or "CARTAO" in name or "CARTÃO" in name:
+                emoji = "💳"
+            else:
+                emoji = "📄"
+            report.append(f"  {emoji} {name}: {fmt_brl(val)} ({fmt_pct(perc)}%)")
+
+        report.append("\n📍 _Fonte: /relatorio/faturamento-forma-pagamento_")
         return "\n".join(report)
         
     except Exception as e:
@@ -6030,6 +6469,132 @@ def get_fiscal_product_audit(restaurant_name):
         import traceback
         print(f"[FISCAL_AUDIT_ERROR] {str(e)}\n{traceback.format_exc()}")
         return f"Erro na auditoria fiscal de produtos: {str(e)}"
+
+
+def update_product_ncm(restaurant_name, product_name, novo_ncm, novo_cest=None, novo_cst=None, novo_cfop=None):
+    """
+    Atualiza o NCM (e opcionalmente CEST, CST/CSOSN, CFOP) de um produto no cadastro do NetControll.
+    Usa o mesmo padrão de apply_price_change: GET lista → GET /completo → PUT com dados atualizados.
+
+    Parâmetros:
+        restaurant_name: nome do restaurante
+        product_name:    nome (parcial) do produto a atualizar
+        novo_ncm:        código NCM com 8 dígitos numéricos (ex: "22030000")
+        novo_cest:       (opcional) código CEST
+        novo_cst:        (opcional) CST ou CSOSN
+        novo_cfop:       (opcional) CFOP
+    """
+    rest = find_restaurant_files(restaurant_name)
+    session = get_session_for_rest(rest['id'])
+    if not session:
+        return "Erro de autenticação no portal."
+
+    # Validação do NCM
+    ncm_limpo = str(novo_ncm).strip().replace('.', '').replace('-', '')
+    if len(ncm_limpo) != 8 or not ncm_limpo.isdigit():
+        return (
+            f"❌ NCM inválido: '{novo_ncm}'. "
+            "O NCM deve ter exatamente 8 dígitos numéricos (ex: 22030000)."
+        )
+
+    try:
+        # 1. Buscar lista de produtos
+        r = session.get(PRODUCT_URL)
+        if r.status_code != 200:
+            return f"Erro ao acessar cadastro de produtos (HTTP {r.status_code})."
+
+        products = r.json()
+        match = None
+        for p in products:
+            if normalize_text(product_name) in normalize_text(p.get('nome', '')):
+                match = p
+                break
+
+        if not match:
+            return f"Produto '{product_name}' não encontrado no cadastro de {rest['name']}."
+
+        pid = match['id']
+        nome_produto = match.get('nome', product_name)
+
+        # 2. Baixar ficha completa
+        rd = session.get(f"{PRODUCT_URL}/{pid}/completo")
+        if rd.status_code != 200:
+            return f"Erro ao baixar ficha do produto '{nome_produto}' (HTTP {rd.status_code})."
+
+        data = rd.json()
+
+        # 3. Registrar valores anteriores para log
+        ncm_anterior  = str(data.get('ncm') or '').strip()
+        cest_anterior = str(data.get('cest') or '').strip()
+        cst_anterior  = str(data.get('cst') or data.get('csosn') or data.get('situacaoTributaria') or '').strip()
+        cfop_anterior = str(data.get('cfop') or '').strip()
+
+        # 4. Aplicar alterações
+        data['ncm'] = ncm_limpo
+
+        if novo_cest is not None:
+            data['cest'] = str(novo_cest).strip()
+
+        if novo_cst is not None:
+            # Atualiza o campo correto dependendo do que existe na ficha
+            if 'csosn' in data:
+                data['csosn'] = str(novo_cst).strip()
+            elif 'situacaoTributaria' in data:
+                data['situacaoTributaria'] = str(novo_cst).strip()
+            else:
+                data['cst'] = str(novo_cst).strip()
+
+        if novo_cfop is not None:
+            data['cfop'] = str(novo_cfop).strip()
+
+        # 5. Validação semântica opcional: avisa se NCM parece incompatível com o grupo
+        grupo = str(data.get('nomeSubgrupo') or '').strip()
+        expected_chapters = _get_expected_chapters_for_group(grupo)
+        aviso_semantico = ""
+        if expected_chapters and ncm_limpo[:2] not in expected_chapters:
+            try:
+                desc_ncm = lookup_ncm_description(ncm_limpo)
+            except Exception:
+                desc_ncm = None
+            cap_desc = f" ({desc_ncm})" if desc_ncm else ""
+            aviso_semantico = (
+                f"\n⚠️ *Atenção: o NCM {ncm_limpo}{cap_desc} parece incompatível com o grupo "
+                f"'{grupo}' (capítulos esperados: {', '.join(expected_chapters)}). "
+                "Verifique se o NCM está correto antes de emitir NFC-e.*"
+            )
+
+        # 6. Enviar atualização
+        r_put = session.put(f"{PRODUCT_URL}/{pid}", json=data)
+
+        if r_put.status_code in [200, 201, 204]:
+            linhas = [
+                f"✅ **NCM ATUALIZADO COM SUCESSO**",
+                f"",
+                f"📦 Produto : {nome_produto}  ({rest['name']})",
+                f"🔢 NCM Anterior : {ncm_anterior or 'não cadastrado'}",
+                f"🔢 Novo NCM     : {ncm_limpo}",
+            ]
+            if novo_cest is not None:
+                linhas.append(f"📋 CEST: {cest_anterior or 'N/A'} → {data.get('cest', '')}")
+            if novo_cst is not None:
+                linhas.append(f"📋 CST/CSOSN: {cst_anterior or 'N/A'} → {novo_cst}")
+            if novo_cfop is not None:
+                linhas.append(f"📋 CFOP: {cfop_anterior or 'N/A'} → {novo_cfop}")
+            if aviso_semantico:
+                linhas.append(aviso_semantico)
+            return "\n".join(linhas)
+        else:
+            try:
+                detalhe = r_put.json()
+            except Exception:
+                detalhe = r_put.text[:300]
+            return (
+                f"❌ Falha ao atualizar produto '{nome_produto}' "
+                f"(HTTP {r_put.status_code}).\nDetalhe: {detalhe}"
+            )
+
+    except Exception as e:
+        return f"Erro ao atualizar NCM do produto: {str(e)}"
 
 
 # --- FIM DO ARQUIVO ---
